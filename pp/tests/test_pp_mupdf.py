@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import unittest
 
-from pdfgen import PDF, append_update, ref, simple_document, text, text_content
+from pdfgen import PDF, append_update, encrypt, ref, simple_document, text, text_content
 
 TOOL = os.path.abspath(os.environ.get('PP_MUPDF', 'build/release/pp-mupdf'))
 # A folder to keep every PDF the tests build and pp-mupdf writes, named after the test.
@@ -336,6 +336,19 @@ class ReadAnnotations(Tool):
         d = self.read(pdf.build(root))['pages'][0]['annots'][0]['dict']
         self.assertEqual(d['/Foo']['/Self'], '%d 0 R' % loop)
 
+    def test_no_chars_option(self):
+        # A writer only needs the annotation list; --no-chars skips the text extraction.
+        pdf = PDF()
+        highlight = pdf.add(HIGHLIGHT)
+        pdf, root, _ = one_page(annots=b'[%s]' % ref(highlight), pdf=pdf)
+        data = pdf.build(root)
+        self.ok('read', self.save(data), self.path('r.json'), '--no-chars')
+        with open(self.path('r.json'), encoding='utf-8') as f:
+            page = json.load(f)['pages'][0]
+        self.assertEqual(len(page['annots']), 1)
+        self.assertNotIn('chars', page)
+        self.assertIn('chars', self.read(data)['pages'][0])
+
     def test_page_without_text_markup_has_no_chars(self):
         pdf = PDF()
         note = pdf.add(b'<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] >>')
@@ -522,6 +535,49 @@ class Write(Tool):
                          ascii=True)
         annots = self.read(out)['pages'][0]['annots']
         self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:' + v for v in values])
+
+    def test_double_quotes_survive(self):
+        # MuPDF's JSON parser dropped the \" escape, and every JSON writer escapes quotes.
+        values = ['say "hi"', '"', 'a \\"b\\" c']
+        for ascii in (False, True):
+            with self.subTest(ascii=ascii):
+                objects = {'@n%d' % i: text_annot(v) for i, v in enumerate(values)}
+                out = self.write(self.three_annotations()[0],
+                                 {'objects': objects,
+                                  'pages': [{'index': 0, 'keep': [], 'add': list(objects)}]},
+                                 ascii=ascii)
+                annots = self.read(out)['pages'][0]['annots']
+                self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:' + v for v in values])
+
+    def test_same_input_same_bytes(self):
+        # The document ID is kept, so a write is reproducible (with and without an /ID).
+        plan = {'objects': {'@n': text_annot('note')}, 'pages': [{'index': 0, 'add': ['@n']}]}
+        pdf, root, _ = one_page()
+        for trailer in (b'', b'/ID [<00112233445566778899aabbccddeeff> <00112233445566778899aabbccddeeff>]'):
+            with self.subTest(trailer=trailer):
+                data = pdf.build(root, trailer=trailer)
+                first = self.write(data, plan)
+                self.assertEqual(self.write(data, plan), first)
+                if trailer:
+                    self.assertIn(b'<00112233445566778899AABBCCDDEEFF>', first.upper())
+
+    def test_encrypted_input_is_written_decrypted(self):
+        # Older PDFs are often encrypted with an empty user password. They read like any
+        # other, and the written file is not encrypted, as with PDFBox's writer.
+        pdf = PDF()
+        highlight = pdf.add(HIGHLIGHT)
+        pdf, root, _ = one_page(annots=b'[%s]' % ref(highlight), pdf=pdf)
+        trailer = encrypt(pdf)
+        data = pdf.build(root, trailer=trailer)
+        self.assertIn(b'/Encrypt', data)
+        self.assertEqual(''.join(chr(c[0]) for c in self.chars(data)), 'HelloWorld')
+        out = self.write(data, {'objects': {'@n': text_annot('new')},
+                                'pages': [{'index': 0, 'add': ['@n']}]})
+        self.assertNotIn(b'/Encrypt', out)
+        self.assertOpensCleanly(out)
+        page = self.read(out)['pages'][0]
+        self.assertEqual([a['dict']['/Subtype'] for a in page['annots']], ['/Highlight', '/Text'])
+        self.assertEqual(''.join(chr(c[0]) for c in page['chars']), 'HelloWorld')
 
     def test_binary_string(self):
         out = self.write(self.three_annotations()[0], {

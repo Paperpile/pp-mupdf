@@ -12,6 +12,7 @@ build() can also produce the damaged and modern layouts real files come in: wron
 offsets, no xref at all, cross-reference and object streams, incremental updates.
 """
 
+import hashlib
 import zlib
 
 
@@ -55,7 +56,7 @@ class PDF:
         body = body.rstrip()[:-2] + b' /Length %d >>' % len(stream)
         return b'%d 0 obj\n%s\nstream\n%s\nendstream\nendobj\n' % (num, body, stream)
 
-    def build(self, root, xref='table', info=None):
+    def build(self, root, xref='table', info=None, trailer=b''):
         """xref: 'table', 'stream' (objects in an object stream, cross-reference stream),
         'broken' (a table with every offset wrong) or 'none' (no table, no trailer)."""
         out = bytearray(b'%%PDF-%s\n%%\xe2\xe3\xcf\xd3\n' % self.version)
@@ -77,7 +78,7 @@ class PDF:
         out += b'trailer\n<< /Size %d /Root %s' % (size, ref(root))
         if info:
             out += b' /Info ' + ref(info)
-        out += b' >>\nstartxref\n%d\n%%%%EOF\n' % start
+        out += b' ' + trailer + b' >>\nstartxref\n%d\n%%%%EOF\n' % start
         return bytes(out)
 
     def _build_compressed(self, out, root):
@@ -110,6 +111,43 @@ class PDF:
         out += self._object(xref_num, dict_, bytes(rows))
         out += b'startxref\n%d\n%%%%EOF\n' % start
         return bytes(out)
+
+
+PASSWORD_PAD = bytes.fromhex('28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A')
+
+
+def rc4(key, data):
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) % 256
+        s[i], s[j] = s[j], s[i]
+    out, i, j = bytearray(), 0, 0
+    for byte in data:
+        i = (i + 1) % 256
+        j = (j + s[i]) % 256
+        s[i], s[j] = s[j], s[i]
+        out.append(byte ^ s[(s[i] + s[j]) % 256])
+    return bytes(out)
+
+
+def encrypt(pdf, file_id=b'0123456789abcdef', owner_password=b'owner'):
+    """Encrypts the streams of pdf in place with the standard security handler, revision 2
+    (RC4, 40-bit key) and an empty user password, as many older PDFs are. Returns the
+    trailer entries (/Encrypt and /ID). Strings outside streams are not encrypted, so a
+    document using this must keep its text in streams."""
+    owner_key = hashlib.md5(owner_password + PASSWORD_PAD[:32 - len(owner_password)]).digest()[:5]
+    o = rc4(owner_key, PASSWORD_PAD)
+    p = -4  # print and everything else allowed
+    key = hashlib.md5(PASSWORD_PAD + o + p.to_bytes(4, 'little', signed=True) + file_id).digest()[:5]
+    u = rc4(key, PASSWORD_PAD)
+    for num, (body, stream) in list(pdf.objects.items()):
+        if stream is not None:
+            object_key = hashlib.md5(key + num.to_bytes(3, 'little') + (0).to_bytes(2, 'little')).digest()[:10]
+            pdf.objects[num] = (body, rc4(object_key, stream))
+    encrypt_num = pdf.add(b'<< /Filter /Standard /V 1 /R 2 /O <%s> /U <%s> /P %d >>' % (
+        o.hex().encode(), u.hex().encode(), p))
+    return b'/Encrypt %s /ID [<%s> <%s>]' % (ref(encrypt_num), file_id.hex().encode(), file_id.hex().encode())
 
 
 def append_update(data, objects, root, size):

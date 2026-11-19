@@ -142,6 +142,7 @@ json_unescape_string(struct json_parser *pp, const char *s, const char *end, int
 				x |= unhex(*s++);
 				p += fz_runetochar(p, x);
 				break;
+			case '"': *p++ = '"'; break; /* pp-mupdf: missing upstream, \" was dropped */
 			case '\\': *p++ = '\\'; break;
 			case '/': *p++ = '/'; break;
 			case 'b': *p++ = '\b'; break;

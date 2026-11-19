@@ -6,14 +6,14 @@ semantics: the caller decides what to read and describes everything it writes.
 
 Everything added to MuPDF lives in `pp/`. The rest of the tree is upstream MuPDF, unchanged
 except for `.gitmodules`, whose relative submodule URLs point to Artifex's GitHub repositories
-instead.
+instead, and a one-line fix in `source/fitz/json.c` (the JSON parser dropped `\"`).
 
 ## Commands
 
     pp-mupdf version
     pp-mupdf info   <in.pdf> <out.json>
     pp-mupdf check  <in.pdf>
-    pp-mupdf read   <in.pdf> <out.json>
+    pp-mupdf read   <in.pdf> <out.json> [--no-chars]
     pp-mupdf write  <in.pdf> <plan.json> <out.pdf>
     pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]
 

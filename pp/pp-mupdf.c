@@ -9,7 +9,7 @@
  *   pp-mupdf version
  *   pp-mupdf info   <in.pdf> <out.json>
  *   pp-mupdf check  <in.pdf>
- *   pp-mupdf read   <in.pdf> <out.json>
+ *   pp-mupdf read   <in.pdf> <out.json> [--no-chars]
  *   pp-mupdf write  <in.pdf> <plan.json> <out.pdf>
  *   pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]
  *
@@ -35,7 +35,7 @@ static void usage(void)
 		"  pp-mupdf version\n"
 		"  pp-mupdf info   <in.pdf> <out.json>\n"
 		"  pp-mupdf check  <in.pdf>\n"
-		"  pp-mupdf read   <in.pdf> <out.json>\n"
+		"  pp-mupdf read   <in.pdf> <out.json> [--no-chars]\n"
 		"  pp-mupdf write  <in.pdf> <plan.json> <out.pdf>\n"
 		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n");
 }
@@ -449,7 +449,7 @@ static void cmd_check(fz_context *ctx, const char *in_path)
 
 /* ---- read ------------------------------------------------------------------- */
 
-static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path)
+static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path, int with_chars)
 {
 	pdf_document *doc = pdf_open_document(ctx, in_path);
 	fz_pool *pool = fz_new_pool(ctx);
@@ -484,7 +484,7 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path)
 
 			fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page_obj));
 			fz_json_object_set(ctx, pool, p, "annots", list);
-			if (has_markup)
+			if (has_markup && with_chars)
 			{
 				pdf_page *page = pdf_load_page(ctx, doc, i);
 				fz_try(ctx)
@@ -711,15 +711,17 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
 {
 	pdf_write_options opts;
 	/* Garbage collection on save: a plain save of a document MuPDF repaired on open can
-	 * drop newly added annotations without an error. */
-	pdf_parse_write_options(ctx, &opts, "garbage");
+	 * drop newly added annotations without an error. The document ID is kept, so the same
+	 * input and plan give the same bytes, and encryption is removed (as PDFBox's writer
+	 * does), which also avoids fresh random encryption values on every save. */
+	pdf_parse_write_options(ctx, &opts, "garbage,regenerate-id=no,decrypt");
 	fz_try(ctx)
 		pdf_save_document(ctx, doc, out_path, &opts);
 	fz_catch(ctx)
 	{
 		fz_report_error(ctx);
 		fz_warn(ctx, "garbage-collecting save failed, saving without");
-		pdf_parse_write_options(ctx, &opts, "");
+		pdf_parse_write_options(ctx, &opts, "regenerate-id=no,decrypt");
 		pdf_save_document(ctx, doc, out_path, &opts);
 	}
 }
@@ -943,7 +945,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(cmd, "check") && argc == 3)
 			cmd_check(ctx, argv[2]);
 		else if (!strcmp(cmd, "read") && argc == 4)
-			cmd_read(ctx, argv[2], argv[3]);
+			cmd_read(ctx, argv[2], argv[3], 1);
+		else if (!strcmp(cmd, "read") && argc == 5 && !strcmp(argv[4], "--no-chars"))
+			cmd_read(ctx, argv[2], argv[3], 0);
 		else if (!strcmp(cmd, "write") && argc == 5)
 			cmd_write(ctx, argv[2], argv[3], argv[4]);
 		else if (!strcmp(cmd, "render") && argc >= 7 && (argc - 5) % 2 == 0)
