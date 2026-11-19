@@ -33,6 +33,17 @@ Needs a C compiler, make and Python 3 with [fontTools](https://github.com/fontto
     make -f pp/Makefile                 # full:  build/release/pp-mupdf
     make -f pp/Makefile fonts=stripped  # small: build/release-stripped/pp-mupdf
 
+Platforms (MuPDF and its libraries are always linked statically):
+
+    make -f pp/Makefile static=yes                  # Linux; with musl fully static
+    make -f pp/Makefile arch=arm64                  # macOS, one architecture each, joined with lipo
+    make -f pp/Makefile OS=MINGW CC=x86_64-w64-mingw32-gcc \
+        AR=x86_64-w64-mingw32-ar STRIP=x86_64-w64-mingw32-strip   # Windows, cross-compiled
+
+`.github/workflows/pp-mupdf.yml` builds both variants for Linux (x64, arm64), macOS
+(universal) and Windows (x64), runs the tests on each, and attaches the binaries to a release
+for tags `v*`. `make -f pp/Makefile test` runs the tests against a local build.
+
 The full variant has every MuPDF font. The small variant keeps every font with its Unicode
 map and metrics but without glyph outlines or layout tables (`pp/strip-font-outlines.py`):
 it extracts the same text, but text that falls back to those fonts renders blank.
