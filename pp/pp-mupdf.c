@@ -1,0 +1,851 @@
+/*
+ * pp-mupdf: PDF annotation operations on MuPDF, as a command line tool.
+ *
+ * The tool knows PDF objects, not annotations: the caller interprets what it reads and
+ * describes everything it writes as PDF objects. All structured input and output is JSON
+ * in files; the exit code is the only failure signal (MuPDF prints repair warnings to
+ * stderr on healthy files).
+ *
+ *   pp-mupdf version
+ *   pp-mupdf info   <in.pdf> <out.json>
+ *   pp-mupdf check  <in.pdf>
+ *   pp-mupdf read   <in.pdf> <out.json>
+ *   pp-mupdf write  <in.pdf> <plan.json> <out.pdf>
+ *   pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]
+ *
+ * PDF values in JSON follow qpdf's JSON v2 conventions: names "/Name", text strings
+ * "u:text", binary strings "b:<hex>", references "12 0 R". In a write plan "@id" refers to
+ * an object the plan creates. Numbers are written with the shortest digits that reproduce
+ * MuPDF's 32-bit value, so a reader that rounds them to float32 gets the exact value.
+ */
+#include "mupdf/fitz.h"
+#include "mupdf/pdf.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PP_MUPDF_VERSION "0.1.0"
+#define MAX_DEPTH 8
+
+static void usage(void)
+{
+	fprintf(stderr,
+		"usage:\n"
+		"  pp-mupdf version\n"
+		"  pp-mupdf info   <in.pdf> <out.json>\n"
+		"  pp-mupdf check  <in.pdf>\n"
+		"  pp-mupdf read   <in.pdf> <out.json>\n"
+		"  pp-mupdf write  <in.pdf> <plan.json> <out.pdf>\n"
+		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n");
+}
+
+/* ---- JSON output helpers ------------------------------------------------- */
+
+static fz_json *json_ref(fz_context *ctx, fz_pool *pool, pdf_obj *ref)
+{
+	char buf[64];
+	fz_snprintf(buf, sizeof buf, "%d %d R", pdf_to_num(ctx, ref), pdf_to_gen(ctx, ref));
+	return fz_json_new_string(ctx, pool, buf);
+}
+
+static fz_json *json_numbers(fz_context *ctx, fz_pool *pool, const float *v, int n)
+{
+	fz_json *arr = fz_json_new_array(ctx, pool);
+	int i;
+	for (i = 0; i < n; i++)
+		fz_json_array_push(ctx, pool, arr, fz_json_new_number(ctx, pool, v[i]));
+	return arr;
+}
+
+static fz_json *json_rect(fz_context *ctx, fz_pool *pool, fz_rect r)
+{
+	float v[4] = { r.x0, r.y0, r.x1, r.y1 };
+	return json_numbers(ctx, pool, v, 4);
+}
+
+static fz_json *json_matrix(fz_context *ctx, fz_pool *pool, fz_matrix m)
+{
+	float v[6] = { m.a, m.b, m.c, m.d, m.e, m.f };
+	return json_numbers(ctx, pool, v, 6);
+}
+
+static void write_json_file(fz_context *ctx, const char *path, fz_json *json)
+{
+	fz_output *out = fz_new_output_with_path(ctx, path, 0);
+	fz_try(ctx)
+	{
+		fz_write_json(ctx, out, json);
+		fz_close_output(ctx, out);
+	}
+	fz_always(ctx)
+		fz_drop_output(ctx, out);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* "/Name", "u:text" or "b:hex" for a name or string. */
+static fz_json *json_name(fz_context *ctx, fz_pool *pool, pdf_obj *obj)
+{
+	const char *name = pdf_to_name(ctx, obj);
+	size_t n = strlen(name);
+	char *s = fz_pool_alloc(ctx, pool, n + 2);
+	s[0] = '/';
+	memcpy(s + 1, name, n + 1);
+	return fz_json_new_string(ctx, pool, s);
+}
+
+static fz_json *json_text(fz_context *ctx, fz_pool *pool, pdf_obj *obj)
+{
+	const char *text = pdf_to_text_string(ctx, obj);
+	size_t n = strlen(text);
+	char *s = fz_pool_alloc(ctx, pool, n + 3);
+	s[0] = 'u';
+	s[1] = ':';
+	memcpy(s + 2, text, n + 1);
+	return fz_json_new_string(ctx, pool, s);
+}
+
+/* Keys whose values stay references: they point at other annotations, the page or
+ * appearance streams, which the reader resolves by reference itself. */
+static int keep_as_ref(fz_context *ctx, pdf_obj *key)
+{
+	static const char *keys[] = { "P", "Parent", "Popup", "IRT", "AP", "A", "Dest", "StructParent", NULL };
+	const char *k = pdf_to_name(ctx, key);
+	int i;
+	for (i = 0; keys[i]; i++)
+		if (!strcmp(k, keys[i]))
+			return 1;
+	return 0;
+}
+
+static fz_json *obj_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *obj, int depth);
+
+static fz_json *dict_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *dict, int depth)
+{
+	fz_json *out = fz_json_new_object(ctx, pool);
+	int i, n = pdf_dict_len(ctx, dict);
+	for (i = 0; i < n; i++)
+	{
+		pdf_obj *key = pdf_dict_get_key(ctx, dict, i);
+		pdf_obj *val = pdf_dict_get_val(ctx, dict, i);
+		const char *k = pdf_to_name(ctx, key);
+		size_t kn = strlen(k);
+		char *jk = fz_pool_alloc(ctx, pool, kn + 2);
+		fz_json *jv;
+		jk[0] = '/';
+		memcpy(jk + 1, k, kn + 1);
+		if (pdf_is_indirect(ctx, val) && keep_as_ref(ctx, key))
+			jv = json_ref(ctx, pool, val);
+		else
+			jv = obj_to_json(ctx, pool, val, depth + 1);
+		fz_json_object_set(ctx, pool, out, jk, jv);
+	}
+	return out;
+}
+
+/* A PDF value as JSON. References are resolved inline (with a depth limit and a cycle
+ * guard), except streams, which stay references. */
+static fz_json *obj_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *obj, int depth)
+{
+	fz_json *out = NULL;
+	pdf_obj *resolved;
+
+	if (!obj || pdf_is_null(ctx, obj))
+		return fz_json_new_null(ctx, pool);
+
+	if (pdf_is_indirect(ctx, obj))
+	{
+		resolved = pdf_resolve_indirect(ctx, obj);
+		if (!resolved || pdf_is_stream(ctx, obj) || depth >= MAX_DEPTH)
+			return json_ref(ctx, pool, obj);
+		if (pdf_mark_obj(ctx, resolved))
+			return json_ref(ctx, pool, obj); /* a cycle */
+		fz_try(ctx)
+			out = obj_to_json(ctx, pool, resolved, depth);
+		fz_always(ctx)
+			pdf_unmark_obj(ctx, resolved);
+		fz_catch(ctx)
+			fz_rethrow(ctx);
+		return out;
+	}
+
+	if (pdf_is_bool(ctx, obj))
+		return fz_json_new_boolean(ctx, pool, pdf_to_bool(ctx, obj));
+	if (pdf_is_int(ctx, obj))
+		return fz_json_new_number(ctx, pool, (double)pdf_to_int64(ctx, obj));
+	if (pdf_is_real(ctx, obj))
+		return fz_json_new_number(ctx, pool, pdf_to_real(ctx, obj));
+	if (pdf_is_name(ctx, obj))
+		return json_name(ctx, pool, obj);
+	if (pdf_is_string(ctx, obj))
+		return json_text(ctx, pool, obj);
+	if (pdf_is_array(ctx, obj))
+	{
+		int i, n = pdf_array_len(ctx, obj);
+		out = fz_json_new_array(ctx, pool);
+		for (i = 0; i < n; i++)
+			fz_json_array_push(ctx, pool, out, obj_to_json(ctx, pool, pdf_array_get(ctx, obj, i), depth + 1));
+		return out;
+	}
+	if (pdf_is_dict(ctx, obj))
+		return dict_to_json(ctx, pool, obj, depth);
+	return fz_json_new_null(ctx, pool);
+}
+
+/* ---- page helpers ---------------------------------------------------------- */
+
+static fz_json *page_box(fz_context *ctx, fz_pool *pool, pdf_obj *page_obj, pdf_obj *key)
+{
+	pdf_obj *box = pdf_dict_get_inheritable(ctx, page_obj, key);
+	float v[4];
+	int i;
+	if (!pdf_is_array(ctx, box) || pdf_array_len(ctx, box) < 4)
+		return fz_json_new_null(ctx, pool);
+	for (i = 0; i < 4; i++)
+		v[i] = pdf_array_get_real(ctx, box, i);
+	return json_numbers(ctx, pool, v, 4);
+}
+
+static int is_text_markup(const char *subtype)
+{
+	return !strcmp(subtype, "Highlight") || !strcmp(subtype, "Underline") ||
+		!strcmp(subtype, "StrikeOut") || !strcmp(subtype, "Squiggly");
+}
+
+/* The page's structured text from its content stream only: annotation appearances are left
+ * out, so the text of a FreeText annotation under a highlight never counts as highlighted. */
+static fz_stext_page *page_text(fz_context *ctx, fz_page *page)
+{
+	fz_stext_options opts = { 0 };
+	fz_stext_page *text;
+	fz_device *dev = NULL;
+
+	opts.flags = FZ_STEXT_PRESERVE_WHITESPACE;
+	text = fz_new_stext_page(ctx, fz_bound_page(ctx, page));
+	fz_var(dev);
+	fz_try(ctx)
+	{
+		dev = fz_new_stext_device(ctx, text, &opts);
+		fz_run_page_contents(ctx, page, dev, fz_identity, NULL);
+		fz_close_device(ctx, dev);
+	}
+	fz_always(ctx)
+		fz_drop_device(ctx, dev);
+	fz_catch(ctx)
+	{
+		fz_drop_stext_page(ctx, text);
+		fz_rethrow(ctx);
+	}
+	return text;
+}
+
+/* The page's characters in page space: [codepoint, originX, originY, line] each, the
+ * line counter increasing per structured-text line, as the markup-text code expects. */
+static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page)
+{
+	fz_stext_page *text;
+	fz_stext_block *block;
+	fz_stext_line *line;
+	fz_stext_char *ch;
+	fz_json *chars = fz_json_new_array(ctx, pool);
+	int line_no = 0;
+
+	text = page_text(ctx, page);
+	fz_try(ctx)
+	{
+		for (block = text->first_block; block; block = block->next)
+		{
+			if (block->type != FZ_STEXT_BLOCK_TEXT)
+				continue;
+			for (line = block->u.t.first_line; line; line = line->next)
+			{
+				line_no++;
+				for (ch = line->first_char; ch; ch = ch->next)
+				{
+					fz_json *c = fz_json_new_array(ctx, pool);
+					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, ch->c));
+					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, ch->origin.x));
+					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, ch->origin.y));
+					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, line_no));
+					fz_json_array_push(ctx, pool, chars, c);
+				}
+			}
+		}
+	}
+	fz_always(ctx)
+		fz_drop_stext_page(ctx, text);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+	return chars;
+}
+
+/* ---- info ------------------------------------------------------------------ */
+
+static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_pool *pool = fz_new_pool(ctx);
+	fz_try(ctx)
+	{
+		fz_json *root = fz_json_new_object(ctx, pool);
+		fz_json *pages = fz_json_new_array(ctx, pool);
+		pdf_obj *labels = pdf_dict_get(ctx, pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME(Root)), PDF_NAME(PageLabels));
+		int has_labels = !pdf_is_null(ctx, labels);
+		int i, n = pdf_count_pages(ctx, doc);
+
+		fz_json_object_set(ctx, pool, root, "numberOfPages", fz_json_new_number(ctx, pool, n));
+		fz_json_object_set(ctx, pool, root, "hasPageLabels", fz_json_new_boolean(ctx, pool, has_labels));
+		for (i = 0; i < n; i++)
+		{
+			pdf_page *page = pdf_load_page(ctx, doc, i);
+			fz_try(ctx)
+			{
+				fz_json *p = fz_json_new_object(ctx, pool);
+				fz_rect mediabox;
+				fz_matrix ctm;
+				pdf_page_transform(ctx, page, &mediabox, &ctm);
+				fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page->obj));
+				fz_json_object_set(ctx, pool, p, "bounds", json_rect(ctx, pool, fz_bound_page(ctx, (fz_page *)page)));
+				fz_json_object_set(ctx, pool, p, "transform", json_matrix(ctx, pool, ctm));
+				fz_json_object_set(ctx, pool, p, "mediaBox", page_box(ctx, pool, page->obj, PDF_NAME(MediaBox)));
+				fz_json_object_set(ctx, pool, p, "cropBox", page_box(ctx, pool, page->obj, PDF_NAME(CropBox)));
+				fz_json_object_set(ctx, pool, p, "rotate", fz_json_new_number(ctx, pool, pdf_dict_get_inheritable_int(ctx, page->obj, PDF_NAME(Rotate))));
+				if (has_labels)
+				{
+					char label[256];
+					pdf_page_label(ctx, doc, i, label, sizeof label);
+					fz_json_object_set(ctx, pool, p, "label", fz_json_new_string(ctx, pool, label));
+				}
+				else
+					fz_json_object_set(ctx, pool, p, "label", fz_json_new_null(ctx, pool));
+				fz_json_array_push(ctx, pool, pages, p);
+			}
+			fz_always(ctx)
+				fz_drop_page(ctx, (fz_page *)page);
+			fz_catch(ctx)
+				fz_rethrow(ctx);
+		}
+		fz_json_object_set(ctx, pool, root, "pages", pages);
+		write_json_file(ctx, out_path, root);
+	}
+	fz_always(ctx)
+	{
+		fz_drop_pool(ctx, pool);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* ---- check ------------------------------------------------------------------ */
+
+/* Loads every page and, on pages with highlights, their quads and the page text: the
+ * work a later read does, so a document that fails here would fail there. */
+static void cmd_check(fz_context *ctx, const char *in_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_try(ctx)
+	{
+		int i, n = pdf_count_pages(ctx, doc);
+		for (i = 0; i < n; i++)
+		{
+			pdf_page *page = pdf_load_page(ctx, doc, i);
+			fz_stext_page *text = NULL;
+			fz_try(ctx)
+			{
+				pdf_annot *annot;
+				for (annot = pdf_first_annot(ctx, page); annot; annot = pdf_next_annot(ctx, annot))
+				{
+					int k, count;
+					if (pdf_annot_type(ctx, annot) != PDF_ANNOT_HIGHLIGHT)
+						continue;
+					if (!text)
+						text = page_text(ctx, (fz_page *)page);
+					count = pdf_annot_quad_point_count(ctx, annot);
+					for (k = 0; k < count; k++)
+						(void)pdf_annot_quad_point(ctx, annot, k);
+				}
+			}
+			fz_always(ctx)
+			{
+				fz_drop_stext_page(ctx, text);
+				fz_drop_page(ctx, (fz_page *)page);
+			}
+			fz_catch(ctx)
+				fz_rethrow(ctx);
+		}
+	}
+	fz_always(ctx)
+		pdf_drop_document(ctx, doc);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* ---- read ------------------------------------------------------------------- */
+
+static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_pool *pool = fz_new_pool(ctx);
+	fz_try(ctx)
+	{
+		fz_json *root = fz_json_new_object(ctx, pool);
+		fz_json *pages = fz_json_new_array(ctx, pool);
+		int i, n = pdf_count_pages(ctx, doc);
+		for (i = 0; i < n; i++)
+		{
+			pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, i);
+			pdf_obj *annots = pdf_dict_get(ctx, page_obj, PDF_NAME(Annots));
+			fz_json *p = fz_json_new_object(ctx, pool);
+			fz_json *list = fz_json_new_array(ctx, pool);
+			int k, count = pdf_array_len(ctx, annots), has_markup = 0;
+
+			for (k = 0; k < count; k++)
+			{
+				pdf_obj *entry = pdf_array_get(ctx, annots, k);
+				fz_json *a = fz_json_new_object(ctx, pool);
+				fz_json_object_set(ctx, pool, a, "ref", pdf_is_indirect(ctx, entry) ? json_ref(ctx, pool, entry) : fz_json_new_null(ctx, pool));
+				if (pdf_is_dict(ctx, entry))
+				{
+					fz_json_object_set(ctx, pool, a, "dict", dict_to_json(ctx, pool, pdf_resolve_indirect(ctx, entry), 0));
+					if (is_text_markup(pdf_dict_get_name(ctx, entry, PDF_NAME(Subtype))))
+						has_markup = 1;
+				}
+				else
+					fz_json_object_set(ctx, pool, a, "dict", fz_json_new_null(ctx, pool));
+				fz_json_array_push(ctx, pool, list, a);
+			}
+
+			fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page_obj));
+			fz_json_object_set(ctx, pool, p, "annots", list);
+			if (has_markup)
+			{
+				pdf_page *page = pdf_load_page(ctx, doc, i);
+				fz_try(ctx)
+				{
+					fz_rect mediabox;
+					fz_matrix ctm;
+					pdf_page_transform(ctx, page, &mediabox, &ctm);
+					fz_json_object_set(ctx, pool, p, "transform", json_matrix(ctx, pool, ctm));
+					fz_json_object_set(ctx, pool, p, "chars", page_chars(ctx, pool, (fz_page *)page));
+				}
+				fz_always(ctx)
+					fz_drop_page(ctx, (fz_page *)page);
+				fz_catch(ctx)
+					fz_rethrow(ctx);
+			}
+			fz_json_array_push(ctx, pool, pages, p);
+		}
+		fz_json_object_set(ctx, pool, root, "pages", pages);
+		write_json_file(ctx, out_path, root);
+	}
+	fz_always(ctx)
+	{
+		fz_drop_pool(ctx, pool);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* ---- write ------------------------------------------------------------------ */
+
+typedef struct
+{
+	const char *id;
+	int num;
+} new_object;
+
+typedef struct
+{
+	new_object *list;
+	int len;
+} new_objects;
+
+static int lookup_new(fz_context *ctx, new_objects *objs, const char *id)
+{
+	int i;
+	for (i = 0; i < objs->len; i++)
+		if (!strcmp(objs->list[i].id, id))
+			return objs->list[i].num;
+	fz_throw(ctx, FZ_ERROR_SYNTAX, "plan refers to %s, which it does not create", id);
+}
+
+static int hexval(int c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* JSON -> PDF value: the inverse of obj_to_json, plus "@id" for created objects. */
+static pdf_obj *json_to_obj(fz_context *ctx, pdf_document *doc, new_objects *objs, fz_json *v)
+{
+	if (fz_json_is_null(ctx, v))
+		return PDF_NULL;
+	if (fz_json_is_boolean(ctx, v))
+		return fz_json_to_boolean(ctx, v) ? PDF_TRUE : PDF_FALSE;
+	if (fz_json_is_number(ctx, v))
+	{
+		double d = fz_json_to_number(ctx, v);
+		if (d == (double)(int64_t)d && d > -1e15 && d < 1e15)
+			return pdf_new_int(ctx, (int64_t)d);
+		return pdf_new_real(ctx, (float)d);
+	}
+	if (fz_json_is_string(ctx, v))
+	{
+		const char *s = fz_json_to_string(ctx, v);
+		int num, gen;
+		char tail;
+		if (s[0] == '/')
+			return pdf_new_name(ctx, s + 1);
+		if (s[0] == '@')
+			return pdf_new_indirect(ctx, doc, lookup_new(ctx, objs, s), 0);
+		if (!strncmp(s, "u:", 2))
+			return pdf_new_text_string(ctx, s + 2);
+		if (!strncmp(s, "b:", 2))
+		{
+			size_t i, n = strlen(s + 2) / 2;
+			unsigned char *bytes = fz_malloc(ctx, n + 1);
+			pdf_obj *str = NULL;
+			for (i = 0; i < n; i++)
+			{
+				int hi = hexval(s[2 + 2 * i]), lo = hexval(s[3 + 2 * i]);
+				if (hi < 0 || lo < 0)
+				{
+					fz_free(ctx, bytes);
+					fz_throw(ctx, FZ_ERROR_SYNTAX, "bad hex string in plan: %s", s);
+				}
+				bytes[i] = (unsigned char)(hi * 16 + lo);
+			}
+			fz_try(ctx)
+				str = pdf_new_string(ctx, (const char *)bytes, n);
+			fz_always(ctx)
+				fz_free(ctx, bytes);
+			fz_catch(ctx)
+				fz_rethrow(ctx);
+			return str;
+		}
+		if (sscanf(s, "%d %d R%c", &num, &gen, &tail) == 2)
+			return pdf_new_indirect(ctx, doc, num, gen);
+		fz_throw(ctx, FZ_ERROR_SYNTAX, "plan value is neither a name, string nor reference: %s", s);
+	}
+	if (fz_json_is_array(ctx, v))
+	{
+		int i, n = fz_json_array_length(ctx, v);
+		pdf_obj *arr = pdf_new_array(ctx, doc, n);
+		fz_try(ctx)
+			for (i = 0; i < n; i++)
+				pdf_array_push_drop(ctx, arr, json_to_obj(ctx, doc, objs, fz_json_array_get(ctx, v, i)));
+		fz_catch(ctx)
+		{
+			pdf_drop_obj(ctx, arr);
+			fz_rethrow(ctx);
+		}
+		return arr;
+	}
+	if (fz_json_is_object(ctx, v))
+	{
+		fz_json_object *o;
+		pdf_obj *dict = pdf_new_dict(ctx, doc, 8);
+		fz_try(ctx)
+			for (o = v->u.object; o; o = o->next)
+			{
+				if (o->key[0] != '/')
+					fz_throw(ctx, FZ_ERROR_SYNTAX, "dictionary key must start with /: %s", o->key);
+				pdf_dict_put_drop(ctx, dict, pdf_new_name(ctx, o->key + 1), json_to_obj(ctx, doc, objs, o->value));
+			}
+		fz_catch(ctx)
+		{
+			pdf_drop_obj(ctx, dict);
+			fz_rethrow(ctx);
+		}
+		return dict;
+	}
+	fz_throw(ctx, FZ_ERROR_SYNTAX, "unexpected JSON value in plan");
+}
+
+/* Stream data as Latin-1: each code point below 256 is one byte. The plan's content
+ * streams are built for single-byte fonts, so anything else is an error in the plan. */
+static fz_buffer *latin1_buffer(fz_context *ctx, const char *utf8)
+{
+	fz_buffer *buf = fz_new_buffer(ctx, strlen(utf8));
+	fz_try(ctx)
+	{
+		const char *s = utf8;
+		while (*s)
+		{
+			int c;
+			s += fz_chartorune(&c, s);
+			if (c > 255)
+				fz_throw(ctx, FZ_ERROR_SYNTAX, "stream data has a character above U+00FF (U+%04X)", c);
+			fz_append_byte(ctx, buf, c);
+		}
+	}
+	fz_catch(ctx)
+	{
+		fz_drop_buffer(ctx, buf);
+		fz_rethrow(ctx);
+	}
+	return buf;
+}
+
+static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
+{
+	pdf_write_options opts;
+	/* Garbage collection on save: a plain save of a document MuPDF repaired on open can
+	 * drop newly added annotations without an error. */
+	pdf_parse_write_options(ctx, &opts, "garbage");
+	fz_try(ctx)
+		pdf_save_document(ctx, doc, out_path, &opts);
+	fz_catch(ctx)
+	{
+		fz_report_error(ctx);
+		fz_warn(ctx, "garbage-collecting save failed, saving without");
+		pdf_parse_write_options(ctx, &opts, "");
+		pdf_save_document(ctx, doc, out_path, &opts);
+	}
+}
+
+/*
+ * Plan:
+ *   { "objects": { "@id": <value> | { "stream": { "dict": {...}, "data": "..." } }, ... },
+ *     "pages": [ { "index": 3, "keep": [0, 2], "add": ["@a1", "@p1"] }, ... ] }
+ * "keep" lists the indices of the page's current /Annots entries that stay (all when
+ * absent); "add" appends created objects.
+ */
+static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_path, const char *out_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_pool *pool = fz_new_pool(ctx);
+	fz_buffer *plan_buf = NULL;
+	new_objects objs = { NULL, 0 };
+	fz_try(ctx)
+	{
+		fz_json *plan, *objects, *pages;
+		fz_json_object *o;
+		int i, n, page_count = pdf_count_pages(ctx, doc);
+
+		plan_buf = fz_read_file(ctx, plan_path);
+		plan = fz_parse_json(ctx, pool, fz_string_from_buffer(ctx, plan_buf));
+		objects = fz_json_object_get(ctx, plan, "objects");
+		pages = fz_json_object_get(ctx, plan, "pages");
+
+		/* Numbers first, so objects can refer to each other in any order. */
+		if (objects && fz_json_is_object(ctx, objects))
+		{
+			for (o = objects->u.object; o; o = o->next)
+				objs.len++;
+			objs.list = fz_malloc_array(ctx, objs.len, new_object);
+			i = 0;
+			for (o = objects->u.object; o; o = o->next, i++)
+			{
+				if (o->key[0] != '@')
+					fz_throw(ctx, FZ_ERROR_SYNTAX, "object ids must start with @: %s", o->key);
+				objs.list[i].id = o->key;
+				objs.list[i].num = pdf_create_object(ctx, doc);
+			}
+			i = 0;
+			for (o = objects->u.object; o; o = o->next, i++)
+			{
+				fz_json *stream = fz_json_is_object(ctx, o->value) ? fz_json_object_get(ctx, o->value, "stream") : NULL;
+				if (stream)
+				{
+					fz_json *data = fz_json_object_get(ctx, stream, "data");
+					pdf_obj *dict = json_to_obj(ctx, doc, &objs, fz_json_object_get(ctx, stream, "dict"));
+					pdf_obj *ref = NULL;
+					fz_buffer *buf = NULL;
+					fz_var(ref);
+					fz_var(buf);
+					fz_try(ctx)
+					{
+						pdf_update_object(ctx, doc, objs.list[i].num, dict);
+						ref = pdf_new_indirect(ctx, doc, objs.list[i].num, 0);
+						buf = latin1_buffer(ctx, data ? fz_json_to_string(ctx, data) : "");
+						pdf_update_stream(ctx, doc, ref, buf, 0);
+					}
+					fz_always(ctx)
+					{
+						fz_drop_buffer(ctx, buf);
+						pdf_drop_obj(ctx, ref);
+						pdf_drop_obj(ctx, dict);
+					}
+					fz_catch(ctx)
+						fz_rethrow(ctx);
+				}
+				else
+				{
+					pdf_obj *value = json_to_obj(ctx, doc, &objs, o->value);
+					fz_try(ctx)
+						pdf_update_object(ctx, doc, objs.list[i].num, value);
+					fz_always(ctx)
+						pdf_drop_obj(ctx, value);
+					fz_catch(ctx)
+						fz_rethrow(ctx);
+				}
+			}
+		}
+
+		n = pages ? fz_json_array_length(ctx, pages) : 0;
+		for (i = 0; i < n; i++)
+		{
+			fz_json *p = fz_json_array_get(ctx, pages, i);
+			fz_json *keep = fz_json_object_get(ctx, p, "keep");
+			fz_json *add = fz_json_object_get(ctx, p, "add");
+			fz_json *index = fz_json_object_get(ctx, p, "index");
+			int page_index, k;
+			pdf_obj *page_obj, *old, *annots;
+
+			if (!index || !fz_json_is_number(ctx, index))
+				fz_throw(ctx, FZ_ERROR_SYNTAX, "plan page without an index");
+			page_index = (int)fz_json_to_number(ctx, index);
+			if (page_index < 0 || page_index >= page_count)
+				fz_throw(ctx, FZ_ERROR_ARGUMENT, "plan page index %d out of range", page_index);
+			page_obj = pdf_lookup_page_obj(ctx, doc, page_index);
+			old = pdf_dict_get(ctx, page_obj, PDF_NAME(Annots));
+			annots = pdf_new_array(ctx, doc, 8);
+			fz_try(ctx)
+			{
+				if (keep && fz_json_is_array(ctx, keep))
+				{
+					for (k = 0; k < fz_json_array_length(ctx, keep); k++)
+					{
+						int j = (int)fz_json_to_number(ctx, fz_json_array_get(ctx, keep, k));
+						if (j < 0 || j >= pdf_array_len(ctx, old))
+							fz_throw(ctx, FZ_ERROR_ARGUMENT, "page %d has no /Annots entry %d", page_index, j);
+						pdf_array_push(ctx, annots, pdf_array_get(ctx, old, j));
+					}
+				}
+				else
+				{
+					for (k = 0; k < pdf_array_len(ctx, old); k++)
+						pdf_array_push(ctx, annots, pdf_array_get(ctx, old, k));
+				}
+				if (add && fz_json_is_array(ctx, add))
+					for (k = 0; k < fz_json_array_length(ctx, add); k++)
+						pdf_array_push_drop(ctx, annots, json_to_obj(ctx, doc, &objs, fz_json_array_get(ctx, add, k)));
+				pdf_dict_put(ctx, page_obj, PDF_NAME(Annots), annots);
+			}
+			fz_always(ctx)
+				pdf_drop_obj(ctx, annots);
+			fz_catch(ctx)
+				fz_rethrow(ctx);
+		}
+
+		save(ctx, doc, out_path);
+	}
+	fz_always(ctx)
+	{
+		fz_free(ctx, objs.list);
+		fz_drop_buffer(ctx, plan_buf);
+		fz_drop_pool(ctx, pool);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* ---- render ----------------------------------------------------------------- */
+
+/* The whole page at each scale, RGBA with a transparent background, in page space
+ * (rotation applied, crop box at the origin, y down). info.json gets the bounds and the
+ * transform from PDF space, so the caller can crop annotation thumbnails out of it. */
+static void cmd_render(fz_context *ctx, int argc, char **argv)
+{
+	const char *in_path = argv[0];
+	int page_index = atoi(argv[1]);
+	const char *info_path = argv[2];
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_pool *pool = fz_new_pool(ctx);
+	pdf_page *page = NULL;
+	fz_var(page);
+	fz_try(ctx)
+	{
+		fz_json *info = fz_json_new_object(ctx, pool);
+		fz_rect mediabox;
+		fz_matrix ctm;
+		int i;
+
+		page = pdf_load_page(ctx, doc, page_index);
+		for (i = 3; i + 1 < argc; i += 2)
+		{
+			float scale = (float)atof(argv[i]);
+			fz_pixmap *pix = fz_new_pixmap_from_page(ctx, (fz_page *)page, fz_scale(scale, scale), fz_device_rgb(ctx), 1);
+			fz_try(ctx)
+				fz_save_pixmap_as_pam(ctx, pix, argv[i + 1]);
+			fz_always(ctx)
+				fz_drop_pixmap(ctx, pix);
+			fz_catch(ctx)
+				fz_rethrow(ctx);
+		}
+		pdf_page_transform(ctx, page, &mediabox, &ctm);
+		fz_json_object_set(ctx, pool, info, "bounds", json_rect(ctx, pool, fz_bound_page(ctx, (fz_page *)page)));
+		fz_json_object_set(ctx, pool, info, "transform", json_matrix(ctx, pool, ctm));
+		write_json_file(ctx, info_path, info);
+	}
+	fz_always(ctx)
+	{
+		fz_drop_page(ctx, (fz_page *)page);
+		fz_drop_pool(ctx, pool);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* ---- main --------------------------------------------------------------------- */
+
+int main(int argc, char **argv)
+{
+	fz_context *ctx;
+	int code = 0;
+
+	if (argc < 2)
+	{
+		usage();
+		return 2;
+	}
+	if (!strcmp(argv[1], "version"))
+	{
+		printf("pp-mupdf %s (MuPDF %s)\n", PP_MUPDF_VERSION, FZ_VERSION);
+		return 0;
+	}
+
+	ctx = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
+	if (!ctx)
+	{
+		fprintf(stderr, "pp-mupdf: cannot create MuPDF context\n");
+		return 1;
+	}
+
+	fz_try(ctx)
+	{
+		const char *cmd = argv[1];
+		if (!strcmp(cmd, "info") && argc == 4)
+			cmd_info(ctx, argv[2], argv[3]);
+		else if (!strcmp(cmd, "check") && argc == 3)
+			cmd_check(ctx, argv[2]);
+		else if (!strcmp(cmd, "read") && argc == 4)
+			cmd_read(ctx, argv[2], argv[3]);
+		else if (!strcmp(cmd, "write") && argc == 5)
+			cmd_write(ctx, argv[2], argv[3], argv[4]);
+		else if (!strcmp(cmd, "render") && argc >= 7 && (argc - 5) % 2 == 0)
+			cmd_render(ctx, argc - 2, argv + 2);
+		else
+		{
+			usage();
+			code = 2;
+		}
+	}
+	fz_catch(ctx)
+	{
+		fprintf(stderr, "pp-mupdf %s: %s\n", argv[1], fz_caught_message(ctx));
+		fz_ignore_error(ctx);
+		code = 1;
+	}
+
+	fz_drop_context(ctx);
+	return code;
+}
