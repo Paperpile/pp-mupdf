@@ -70,12 +70,77 @@ static fz_json *json_matrix(fz_context *ctx, fz_pool *pool, fz_matrix m)
 	return json_numbers(ctx, pool, v, 6);
 }
 
+/* A JSON string as UTF-8, escaping only what JSON requires. MuPDF's own writer (1.28)
+ * escapes characters above U+FFFF as "ὠ0" instead of a surrogate pair, and leaves the
+ * control characters U+0014 to U+001F unescaped. */
+static void write_json_string(fz_context *ctx, fz_output *out, const char *s)
+{
+	char utf8[FZ_UTFMAX];
+	int c;
+	fz_write_byte(ctx, out, '"');
+	while (*s)
+	{
+		s += fz_chartorune(&c, s);
+		switch (c)
+		{
+		case '"': fz_write_string(ctx, out, "\\\""); break;
+		case '\\': fz_write_string(ctx, out, "\\\\"); break;
+		case '\n': fz_write_string(ctx, out, "\\n"); break;
+		case '\r': fz_write_string(ctx, out, "\\r"); break;
+		case '\t': fz_write_string(ctx, out, "\\t"); break;
+		default:
+			if (c < 0x20)
+				fz_write_printf(ctx, out, "\\u%04x", c);
+			else
+				fz_write_data(ctx, out, utf8, fz_runetochar(utf8, c));
+		}
+	}
+	fz_write_byte(ctx, out, '"');
+}
+
+/* fz_write_json with the string writer above; numbers, booleans and null as MuPDF writes them. */
+static void write_json(fz_context *ctx, fz_output *out, fz_json *value)
+{
+	fz_json_array *arr;
+	fz_json_object *obj;
+	switch (value->type)
+	{
+	case FZ_JSON_STRING:
+		write_json_string(ctx, out, value->u.string);
+		break;
+	case FZ_JSON_ARRAY:
+		fz_write_byte(ctx, out, '[');
+		for (arr = value->u.array; arr; arr = arr->next)
+		{
+			if (arr != value->u.array)
+				fz_write_byte(ctx, out, ',');
+			write_json(ctx, out, arr->value);
+		}
+		fz_write_byte(ctx, out, ']');
+		break;
+	case FZ_JSON_OBJECT:
+		fz_write_byte(ctx, out, '{');
+		for (obj = value->u.object; obj; obj = obj->next)
+		{
+			if (obj != value->u.object)
+				fz_write_byte(ctx, out, ',');
+			write_json_string(ctx, out, obj->key);
+			fz_write_byte(ctx, out, ':');
+			write_json(ctx, out, obj->value);
+		}
+		fz_write_byte(ctx, out, '}');
+		break;
+	default:
+		fz_write_json(ctx, out, value);
+	}
+}
+
 static void write_json_file(fz_context *ctx, const char *path, fz_json *json)
 {
 	fz_output *out = fz_new_output_with_path(ctx, path, 0);
 	fz_try(ctx)
 	{
-		fz_write_json(ctx, out, json);
+		write_json(ctx, out, json);
 		fz_close_output(ctx, out);
 	}
 	fz_always(ctx)
@@ -480,6 +545,56 @@ static int hexval(int c)
 	return -1;
 }
 
+/* A text string that reads back as written. pdf_new_text_string keeps pure ASCII as single
+ * bytes, but in PDFDocEncoding bytes 0x18 to 0x1F are accents (0x1F reads back as U+02DC)
+ * and 0x7F is undefined, so text with those characters goes out as UTF-16BE instead. */
+static pdf_obj *new_text_string(fz_context *ctx, const char *s)
+{
+	const unsigned char *p;
+	unsigned char *buf;
+	size_t n = 0, i = 0;
+	int c, hi, lo;
+	pdf_obj *str = NULL;
+
+	for (p = (const unsigned char *)s; *p; p++)
+		if ((*p >= 0x18 && *p <= 0x1F) || *p == 0x7F)
+			break;
+	if (!*p)
+		return pdf_new_text_string(ctx, s);
+
+	for (p = (const unsigned char *)s; *p; n++)
+	{
+		p += fz_chartorune(&c, (const char *)p);
+		if (c >= 0x10000)
+			n++;
+	}
+	buf = fz_malloc(ctx, 2 * n + 2);
+	buf[i++] = 0xFE;
+	buf[i++] = 0xFF;
+	while (*s)
+	{
+		s += fz_chartorune(&c, s);
+		if (c >= 0x10000)
+		{
+			hi = 0xD800 + ((c - 0x10000) >> 10);
+			lo = 0xDC00 + ((c - 0x10000) & 0x3FF);
+			buf[i++] = hi >> 8; buf[i++] = hi & 0xFF;
+			buf[i++] = lo >> 8; buf[i++] = lo & 0xFF;
+		}
+		else
+		{
+			buf[i++] = c >> 8; buf[i++] = c & 0xFF;
+		}
+	}
+	fz_try(ctx)
+		str = pdf_new_string(ctx, (const char *)buf, i);
+	fz_always(ctx)
+		fz_free(ctx, buf);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+	return str;
+}
+
 /* JSON -> PDF value: the inverse of obj_to_json, plus "@id" for created objects. */
 static pdf_obj *json_to_obj(fz_context *ctx, pdf_document *doc, new_objects *objs, fz_json *v)
 {
@@ -504,7 +619,7 @@ static pdf_obj *json_to_obj(fz_context *ctx, pdf_document *doc, new_objects *obj
 		if (s[0] == '@')
 			return pdf_new_indirect(ctx, doc, lookup_new(ctx, objs, s), 0);
 		if (!strncmp(s, "u:", 2))
-			return pdf_new_text_string(ctx, s + 2);
+			return new_text_string(ctx, s + 2);
 		if (!strncmp(s, "b:", 2))
 		{
 			size_t i, n = strlen(s + 2) / 2;
