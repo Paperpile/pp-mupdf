@@ -10,6 +10,8 @@
 # (pp/compare-text.sh) at a fraction of the size; text drawn with a fallback font renders
 # blank. The 14 standard PDF fonts keep their outlines in both.
 #
+# make -f pp/Makefile test [fonts=stripped] runs pp/tests against the build.
+#
 # MuPDF and its third-party libraries are linked statically; only the system C library is
 # dynamic. Upstream files stay untouched; this file only passes switches to MuPDF's Makefile.
 
@@ -63,7 +65,11 @@ build/stripped-fonts: pp/strip-font-outlines.py
 	python3 pp/strip-font-outlines.py $@
 	touch $@
 
+# End-to-end tests of the tool on generated PDFs; PP_TEST_PDFS=<dir> keeps the PDFs.
+test: $(TOOL)
+	PP_MUPDF=$(TOOL) python3 -m unittest discover -s pp/tests -v
+
 clean:
 	rm -f $(TOOL)
 
-.PHONY: all libs mutool clean
+.PHONY: all libs mutool test clean
