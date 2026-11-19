@@ -1,0 +1,158 @@
+# Builds pp-mupdf (full and small) for Linux, macOS and Windows, runs pp/tests against every
+# build on its own platform, and attaches the binaries to a GitHub release for tags v*.
+name: pp-mupdf
+
+on:
+  push:
+    branches: [pp]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUBMODULES: >-
+    thirdparty/brotli thirdparty/freetype thirdparty/jbig2dec thirdparty/lcms2
+    thirdparty/libjpeg thirdparty/openjpeg thirdparty/zlib
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 $SUBMODULES
+      # Alpine's musl makes a fully static executable that runs on any Linux.
+      - name: Build and test in Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:3.20 sh -euc '
+            apk add -q build-base python3 py3-fonttools bash
+            make -j"$(nproc)" -f pp/Makefile static=yes
+            make -j"$(nproc)" -f pp/Makefile static=yes fonts=stripped
+            make -f pp/Makefile static=yes test
+            make -f pp/Makefile static=yes fonts=stripped test
+            mkdir -p dist
+            cp build/release/pp-mupdf dist/pp-mupdf-linux-${{ matrix.arch }}
+            cp build/release-stripped/pp-mupdf dist/pp-mupdf-linux-${{ matrix.arch }}-small
+          '
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  macos:
+    name: macOS universal
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 $SUBMODULES
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install fonttools
+      - name: Build arm64 and x86_64, join with lipo
+        run: |
+          mkdir -p dist
+          for variant in full small; do
+            fonts=; suffix=; name=pp-mupdf-macos
+            if [ $variant = small ]; then fonts=fonts=stripped; suffix=-stripped; name=$name-small; fi
+            for arch in arm64 x86_64; do
+              make -j"$(sysctl -n hw.ncpu)" -f pp/Makefile arch=$arch $fonts
+            done
+            lipo -create -output dist/$name \
+              build/release$suffix-arm64/pp-mupdf build/release$suffix-x86_64/pp-mupdf
+          done
+          lipo -info dist/*
+          ls -l dist
+      - name: Test arm64
+        run: |
+          for b in pp-mupdf-macos pp-mupdf-macos-small; do
+            PP_MUPDF=dist/$b python -m unittest discover -s pp/tests
+          done
+      - name: Test x86_64 (Rosetta)
+        run: |
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then echo "no Rosetta, skipped"; exit 0; fi
+          for b in pp-mupdf-macos pp-mupdf-macos-small; do
+            lipo -thin x86_64 -output /tmp/$b-x86_64 dist/$b
+            PP_MUPDF=/tmp/$b-x86_64 python -m unittest discover -s pp/tests
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows-build:
+    name: Windows x64 (build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 $SUBMODULES
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 python3-fonttools
+      - name: Cross-compile with mingw-w64
+        run: |
+          X="OS=MINGW CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar STRIP=x86_64-w64-mingw32-strip"
+          make -j"$(nproc)" -f pp/Makefile $X
+          make -j"$(nproc)" -f pp/Makefile $X fonts=stripped
+          mkdir -p dist
+          cp build/release/pp-mupdf.exe dist/pp-mupdf-windows-x64.exe
+          cp build/release-stripped/pp-mupdf.exe dist/pp-mupdf-windows-x64-small.exe
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  windows-test:
+    name: Windows x64 (test)
+    needs: windows-build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: dist
+      - name: Test
+        shell: bash
+        run: |
+          for b in pp-mupdf-windows-x64.exe pp-mupdf-windows-x64-small.exe; do
+            PP_MUPDF=dist/$b python -m unittest discover -s pp/tests
+          done
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x dist/*
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "pp-mupdf $GITHUB_REF_NAME" --notes "Built from $GITHUB_SHA."
