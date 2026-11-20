@@ -264,6 +264,73 @@ class Layouts(Tool):
         pdf, root, _ = one_page()
         self.ok('check', self.save(pdf.build(root, xref='broken')))
 
+    def test_check_no_repair_fails_where_mupdf_repairs(self):
+        pdf, root, _ = one_page()
+        self.ok('check', self.save(pdf.build(root), 'clean.pdf'), '--no-repair')
+        result = self.fails('check', self.save(pdf.build(root, xref='broken')), '--no-repair')
+        # The error is the last line, after MuPDF's repair warnings.
+        last = result.stderr.strip().split(b'\n')[-1]
+        self.assertTrue(last.startswith(b'pp-mupdf check: document is damaged'), result.stderr)
+
+    def test_check_no_repair_finds_a_broken_object_no_page_uses(self):
+        pdf = PDF()
+        info = pdf.add(b'<< /Title (broken offset) >>')
+        pdf, root, _ = one_page(pdf=pdf)
+        data = pdf.build(root, info=info, bad_offsets={info})
+        self.ok('check', self.save(data))
+        self.fails('check', self.save(data), '--no-repair')
+
+    def repair(self, data):
+        self.ok('repair', self.save(data, 'repair-in.pdf'), self.path('repaired.pdf'))
+        with open(self.path('repaired.pdf'), 'rb') as f:
+            out = f.read()
+        self.ok('check', self.save(out, 'repaired-check.pdf'), '--no-repair')
+        return out
+
+    def test_repair_writes_a_flat_page_tree_with_the_inherited_attributes(self):
+        # Two pages under a nested node that carries MediaBox and Rotate, in a file with a
+        # broken xref.
+        pdf = PDF()
+        root, top, node = pdf.reserve(), pdf.reserve(), pdf.reserve()
+        contents = [pdf.add(b'<< >>', stream=HELLO_WORLD) for _ in range(2)]
+        page_nums = [pdf.add(b'<< /Type /Page /Parent %s /Contents %s >>' % (ref(node), ref(c)))
+                     for c in contents]
+        pdf.set(node, b'<< /Type /Pages /Parent %s /Kids [%s %s] /Count 2 '
+                      b'/MediaBox [0 0 400 500] /Rotate 90 >>' % (ref(top), ref(page_nums[0]),
+                                                                  ref(page_nums[1])))
+        pdf.set(top, b'<< /Type /Pages /Kids [%s] /Count 2 >>' % ref(node))
+        pdf.set(root, b'<< /Type /Catalog /Pages %s >>' % ref(top))
+        data = pdf.build(root, xref='broken')
+        before = self.info(data)['pages']
+
+        out = self.repair(data)
+        self.assertEqual(self.info(out)['pages'], before)
+        self.assertEqual([(p['mediaBox'], p['rotate']) for p in before], [([0, 0, 400, 500], 90)] * 2)
+        self.assertNotIn(b'/Parent %s' % ref(node), out)
+
+    def test_repair_keeps_the_annotations(self):
+        pdf = PDF()
+        annot = pdf.add(b'<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /Contents (kept) >>')
+        pdf, root, _ = one_page(annots=b'[%s]' % ref(annot), pdf=pdf)
+        out = self.repair(pdf.build(root, xref='broken'))
+        annots = self.read(out)['pages'][0]['annots']
+        self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:kept'])
+
+    def test_repair_refuses_a_page_tree_with_non_page_kids(self):
+        # What an incremental update that reused page object numbers for other objects
+        # leaves behind: MuPDF would count the annotation as a page.
+        pdf = PDF()
+        root, pages_num = pdf.reserve(), pdf.reserve()
+        content = pdf.add(b'<< >>', stream=HELLO_WORLD)
+        page = pdf.add(b'<< /Type /Page /Parent %s /Contents %s >>' % (ref(pages_num), ref(content)))
+        annot = pdf.add(b'<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] >>')
+        pdf.set(pages_num, b'<< /Type /Pages /Kids [%s %s] /Count 2 /MediaBox [0 0 612 792] >>' % (
+            ref(page), ref(annot)))
+        pdf.set(root, b'<< /Type /Catalog /Pages %s >>' % ref(pages_num))
+        result = self.fails('repair', self.save(pdf.build(root)), self.path('repaired.pdf'))
+        self.assertIn(b'page 2 is not a page object', result.stderr)
+        self.assertFalse(os.path.exists(self.path('repaired.pdf')))
+
 
 # ---- read: annotation dictionaries ---------------------------------------------------------
 

@@ -12,9 +12,10 @@ instead, and a one-line fix in `source/fitz/json.c` (the JSON parser dropped `\"
 
     pp-mupdf version
     pp-mupdf info   <in.pdf> <out.json>
-    pp-mupdf check  <in.pdf>
+    pp-mupdf check  <in.pdf> [--no-repair]
     pp-mupdf read   <in.pdf> <out.json> [--no-chars]
     pp-mupdf write  <in.pdf> <plan.json> <out.pdf>
+    pp-mupdf repair <in.pdf> <out.pdf>
     pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]
 
 The exit code is the only failure signal; errors go to stderr. PDF objects in JSON follow

@@ -34,9 +34,10 @@ static void usage(void)
 		"usage:\n"
 		"  pp-mupdf version\n"
 		"  pp-mupdf info   <in.pdf> <out.json>\n"
-		"  pp-mupdf check  <in.pdf>\n"
+		"  pp-mupdf check  <in.pdf> [--no-repair]\n"
 		"  pp-mupdf read   <in.pdf> <out.json> [--no-chars]\n"
 		"  pp-mupdf write  <in.pdf> <plan.json> <out.pdf>\n"
+		"  pp-mupdf repair <in.pdf> <out.pdf>\n"
 		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n");
 }
 
@@ -450,14 +451,25 @@ static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 
 /* ---- check ------------------------------------------------------------------ */
 
+static void load_all_objects(fz_context *ctx, pdf_document *doc);
+
 /* Loads every page and, on pages with highlights, their quads and the page text: the
- * work a later read does, so a document that fails here would fail there. */
-static void cmd_check(fz_context *ctx, const char *in_path)
+ * work a later read does, so a document that fails here would fail there.
+ *
+ * With --no-repair it also fails where MuPDF had to repair the file (a broken xref, objects
+ * at wrong offsets) to get there. MuPDF reads such files, but viewers with weaker repair may
+ * not: the caller can store the clean copy `repair` writes instead.
+ * Every object is loaded first, because a broken object that no page uses is otherwise only
+ * found, and repaired, by a later save. */
+static void cmd_check(fz_context *ctx, const char *in_path, int no_repair)
 {
 	pdf_document *doc = pdf_open_document(ctx, in_path);
 	fz_try(ctx)
 	{
-		int i, n = pdf_count_pages(ctx, doc);
+		int i, n;
+		if (no_repair)
+			load_all_objects(ctx, doc);
+		n = pdf_count_pages(ctx, doc);
 		for (i = 0; i < n; i++)
 		{
 			pdf_page *page = pdf_load_page(ctx, doc, i);
@@ -485,6 +497,8 @@ static void cmd_check(fz_context *ctx, const char *in_path)
 			fz_catch(ctx)
 				fz_rethrow(ctx);
 		}
+		if (no_repair && pdf_was_repaired(ctx, doc))
+			fz_throw(ctx, FZ_ERROR_FORMAT, "document is damaged: MuPDF had to repair it");
 	}
 	fz_always(ctx)
 		pdf_drop_document(ctx, doc);
@@ -936,6 +950,62 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 		fz_rethrow(ctx);
 }
 
+/* ---- repair ----------------------------------------------------------------- */
+
+/*
+ * Writes a clean copy of a document MuPDF can open but had to repair (check --no-repair
+ * fails): a new xref, and a new flat page tree of the pages MuPDF finds, in order, each with
+ * the attributes it inherited copied onto it. A save alone keeps a broken page tree as it is,
+ * non-page objects among the kids included, and weaker readers then lose pages.
+ */
+static void cmd_repair(fz_context *ctx, const char *in_path, const char *out_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_obj *pages = NULL, *kids = NULL;
+	fz_var(pages);
+	fz_var(kids);
+	fz_try(ctx)
+	{
+		int i, n;
+		load_all_objects(ctx, doc);
+		n = pdf_count_pages(ctx, doc);
+		if (n == 0)
+			fz_throw(ctx, FZ_ERROR_FORMAT, "document has no pages");
+
+		pages = pdf_add_new_dict(ctx, doc, 3);
+		kids = pdf_new_array(ctx, doc, n);
+		for (i = 0; i < n; i++)
+		{
+			pdf_obj *page = pdf_lookup_page_obj(ctx, doc, i);
+			/* MuPDF takes any leaf of the tree for a page. When an update reused page
+			 * object numbers for other objects, these are annotations or streams, and
+			 * no rebuilt tree gets the pages back: fail and let the caller decide. */
+			if (!pdf_is_indirect(ctx, page) || !pdf_is_dict(ctx, page) ||
+				!pdf_name_eq(ctx, pdf_dict_get(ctx, page, PDF_NAME(Type)), PDF_NAME(Page)))
+				fz_throw(ctx, FZ_ERROR_FORMAT, "page %d is not a page object", i + 1);
+			pdf_flatten_inheritable_page_items(ctx, page);
+			pdf_array_push(ctx, kids, page);
+		}
+		/* After the lookups: they may still walk the old tree. */
+		for (i = 0; i < n; i++)
+			pdf_dict_put(ctx, pdf_array_get(ctx, kids, i), PDF_NAME(Parent), pages);
+		pdf_dict_put(ctx, pages, PDF_NAME(Type), PDF_NAME(Pages));
+		pdf_dict_put(ctx, pages, PDF_NAME(Kids), kids);
+		pdf_dict_put_int(ctx, pages, PDF_NAME(Count), n);
+		pdf_dict_put(ctx, pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME(Root)), PDF_NAME(Pages), pages);
+
+		save(ctx, doc, out_path);
+	}
+	fz_always(ctx)
+	{
+		pdf_drop_obj(ctx, kids);
+		pdf_drop_obj(ctx, pages);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
 /* ---- render ----------------------------------------------------------------- */
 
 /* The whole page at each scale, RGBA with a transparent background, in page space
@@ -1015,13 +1085,17 @@ int main(int argc, char **argv)
 		if (!strcmp(cmd, "info") && argc == 4)
 			cmd_info(ctx, argv[2], argv[3]);
 		else if (!strcmp(cmd, "check") && argc == 3)
-			cmd_check(ctx, argv[2]);
+			cmd_check(ctx, argv[2], 0);
+		else if (!strcmp(cmd, "check") && argc == 4 && !strcmp(argv[3], "--no-repair"))
+			cmd_check(ctx, argv[2], 1);
 		else if (!strcmp(cmd, "read") && argc == 4)
 			cmd_read(ctx, argv[2], argv[3], 1);
 		else if (!strcmp(cmd, "read") && argc == 5 && !strcmp(argv[4], "--no-chars"))
 			cmd_read(ctx, argv[2], argv[3], 0);
 		else if (!strcmp(cmd, "write") && argc == 5)
 			cmd_write(ctx, argv[2], argv[3], argv[4]);
+		else if (!strcmp(cmd, "repair") && argc == 4)
+			cmd_repair(ctx, argv[2], argv[3]);
 		else if (!strcmp(cmd, "render") && argc >= 7 && (argc - 5) % 2 == 0)
 			cmd_render(ctx, argc - 2, argv + 2);
 		else
@@ -1032,6 +1106,8 @@ int main(int argc, char **argv)
 	}
 	fz_catch(ctx)
 	{
+		/* MuPDF's pending "... repeated N times" warning first, so the error is the last line. */
+		fz_flush_warnings(ctx);
 		fprintf(stderr, "pp-mupdf %s: %s\n", argv[1], fz_caught_message(ctx));
 		fz_ignore_error(ctx);
 		code = 1;
