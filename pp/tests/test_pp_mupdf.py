@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from pdfgen import PDF, append_update, encrypt, ref, simple_document, text, text_content
@@ -245,6 +246,20 @@ class Layouts(Tool):
         annots = self.read(data)['pages'][0]['annots']
         self.assertEqual(annots[0]['dict']['/Contents'], 'u:second')
 
+    def test_write_when_one_object_is_broken(self):
+        # Only the save reaches the broken object (here the /Info dictionary). MuPDF repairs
+        # the file then, which dropped the new /Annots without an error.
+        pdf = PDF()
+        info = pdf.add(b'<< /Title (broken offset) >>')
+        pdf, root, _ = one_page(pdf=pdf)
+        data = pdf.build(root, info=info, bad_offsets={info})
+        self.assertEqual(self.read(data)['pages'][0]['annots'], [])
+        out = self.write(data, {'objects': {'@n': text_annot('new')},
+                                'pages': [{'index': 0, 'add': ['@n']}]})
+        self.assertOpensCleanly(out)
+        annots = self.read(out)['pages'][0]['annots']
+        self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:new'])
+
     def test_check_accepts_repairable_file(self):
         pdf, root, _ = one_page()
         self.ok('check', self.save(pdf.build(root, xref='broken')))
@@ -267,6 +282,34 @@ class ReadAnnotations(Tool):
         self.assertEqual(annots[1]['dict']['/Contents'], 'u:direct')
         self.assertEqual(annots[2], {'ref': '99 0 R', 'dict': None})
         self.assertEqual(annots[3], {'ref': None, 'dict': None})
+
+    def test_link_destination_page_stays_a_reference(self):
+        # A link's direct /Dest array names the target page. Inlining that page (once with
+        # 98,568 /ExtGState entries) made a read take minutes and hundreds of megabytes.
+        pdf = PDF()
+        link = pdf.reserve()
+        huge = b' '.join(b'/K%d %d' % (i, i) for i in range(60000))
+        pdf, root, pages = simple_document([(HELLO_WORLD, b'[%s]' % ref(link), None),
+                                            (HELLO_WORLD, None, b'/PieceInfo << %s >>' % huge)],
+                                           pdf=pdf)
+        pdf.set(link, b'<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] '
+                      b'/Dest [%s /XYZ 0 0 0] >>' % ref(pages[1]))
+        started = time.monotonic()
+        annots = self.read(pdf.build(root))['pages'][0]['annots']
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(annots[0]['dict']['/Dest'], ['%d 0 R' % pages[1], '/XYZ', 0, 0, 0])
+
+    def test_page_with_many_characters(self):
+        # A dense page (once 64 seconds) must not take time quadratic in its characters.
+        pdf = PDF()
+        highlight = pdf.add(HIGHLIGHT)
+        lines = [b'x' * 200] * 600
+        pdf, root, _ = one_page(content=text_content(lines, size=1, leading=1),
+                                annots=b'[%s]' % ref(highlight), pdf=pdf)
+        started = time.monotonic()
+        chars = self.read(pdf.build(root))['pages'][0]['chars']
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(len(chars), 120000)
 
     def test_annots_array_behind_a_reference(self):
         pdf = PDF()

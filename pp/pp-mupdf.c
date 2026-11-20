@@ -49,6 +49,33 @@ static fz_json *json_ref(fz_context *ctx, fz_pool *pool, pdf_obj *ref)
 	return fz_json_new_string(ctx, pool, buf);
 }
 
+/*
+ * Appends to a JSON array in constant time. fz_json_array_push walks the whole array for
+ * every item, which takes a minute on a page with many characters.
+ */
+typedef struct
+{
+	fz_json_array **tail;
+} json_list;
+
+static json_list json_list_of(fz_json *array)
+{
+	json_list list;
+	list.tail = &array->u.array;
+	while (*list.tail)
+		list.tail = &(*list.tail)->next;
+	return list;
+}
+
+static void json_list_push(fz_context *ctx, fz_pool *pool, json_list *list, fz_json *item)
+{
+	fz_json_array *entry = fz_pool_alloc(ctx, pool, sizeof *entry);
+	entry->value = item;
+	entry->next = NULL;
+	*list->tail = entry;
+	list->tail = &entry->next;
+}
+
 static fz_json *json_numbers(fz_context *ctx, fz_pool *pool, const float *v, int n)
 {
 	fz_json *arr = fz_json_new_array(ctx, pool);
@@ -186,9 +213,15 @@ static int keep_as_ref(fz_context *ctx, pdf_obj *key)
 
 static fz_json *obj_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *obj, int depth);
 
+/*
+ * The keys of a PDF dictionary are unique, so each member is appended at the end.
+ * fz_json_object_set looks through the members before it adds one, which takes minutes on
+ * dictionaries with tens of thousands of keys.
+ */
 static fz_json *dict_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *dict, int depth)
 {
 	fz_json *out = fz_json_new_object(ctx, pool);
+	fz_json_object **tail = &out->u.object;
 	int i, n = pdf_dict_len(ctx, dict);
 	for (i = 0; i < n; i++)
 	{
@@ -197,14 +230,17 @@ static fz_json *dict_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *dict, int 
 		const char *k = pdf_to_name(ctx, key);
 		size_t kn = strlen(k);
 		char *jk = fz_pool_alloc(ctx, pool, kn + 2);
-		fz_json *jv;
+		fz_json_object *member = fz_pool_alloc(ctx, pool, sizeof *member);
 		jk[0] = '/';
 		memcpy(jk + 1, k, kn + 1);
+		member->key = jk;
 		if (pdf_is_indirect(ctx, val) && keep_as_ref(ctx, key))
-			jv = json_ref(ctx, pool, val);
+			member->value = json_ref(ctx, pool, val);
 		else
-			jv = obj_to_json(ctx, pool, val, depth + 1);
-		fz_json_object_set(ctx, pool, out, jk, jv);
+			member->value = obj_to_json(ctx, pool, val, depth + 1);
+		member->next = NULL;
+		*tail = member;
+		tail = &member->next;
 	}
 	return out;
 }
@@ -223,6 +259,11 @@ static fz_json *obj_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *obj, int de
 	{
 		resolved = pdf_resolve_indirect(ctx, obj);
 		if (!resolved || pdf_is_stream(ctx, obj) || depth >= MAX_DEPTH)
+			return json_ref(ctx, pool, obj);
+		/* A page reached from an annotation (a /Dest array, say) stays a reference: its
+		 * resources can be huge, and every link on every page would repeat them. */
+		if (pdf_name_eq(ctx, pdf_dict_get(ctx, resolved, PDF_NAME(Type)), PDF_NAME(Page)) ||
+			pdf_name_eq(ctx, pdf_dict_get(ctx, resolved, PDF_NAME(Type)), PDF_NAME(Pages)))
 			return json_ref(ctx, pool, obj);
 		if (pdf_mark_obj(ctx, resolved))
 			return json_ref(ctx, pool, obj); /* a cycle */
@@ -248,9 +289,11 @@ static fz_json *obj_to_json(fz_context *ctx, fz_pool *pool, pdf_obj *obj, int de
 	if (pdf_is_array(ctx, obj))
 	{
 		int i, n = pdf_array_len(ctx, obj);
+		json_list items;
 		out = fz_json_new_array(ctx, pool);
+		items = json_list_of(out);
 		for (i = 0; i < n; i++)
-			fz_json_array_push(ctx, pool, out, obj_to_json(ctx, pool, pdf_array_get(ctx, obj, i), depth + 1));
+			json_list_push(ctx, pool, &items, obj_to_json(ctx, pool, pdf_array_get(ctx, obj, i), depth + 1));
 		return out;
 	}
 	if (pdf_is_dict(ctx, obj))
@@ -314,6 +357,7 @@ static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page)
 	fz_stext_line *line;
 	fz_stext_char *ch;
 	fz_json *chars = fz_json_new_array(ctx, pool);
+	json_list list = json_list_of(chars);
 	int line_no = 0;
 
 	text = page_text(ctx, page);
@@ -333,7 +377,7 @@ static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page)
 					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, ch->origin.x));
 					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, ch->origin.y));
 					fz_json_array_push(ctx, pool, c, fz_json_new_number(ctx, pool, line_no));
-					fz_json_array_push(ctx, pool, chars, c);
+					json_list_push(ctx, pool, &list, c);
 				}
 			}
 		}
@@ -355,6 +399,7 @@ static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 	{
 		fz_json *root = fz_json_new_object(ctx, pool);
 		fz_json *pages = fz_json_new_array(ctx, pool);
+		json_list page_list = json_list_of(pages);
 		pdf_obj *labels = pdf_dict_get(ctx, pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME(Root)), PDF_NAME(PageLabels));
 		int has_labels = !pdf_is_null(ctx, labels);
 		int i, n = pdf_count_pages(ctx, doc);
@@ -384,7 +429,7 @@ static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 				}
 				else
 					fz_json_object_set(ctx, pool, p, "label", fz_json_new_null(ctx, pool));
-				fz_json_array_push(ctx, pool, pages, p);
+				json_list_push(ctx, pool, &page_list, p);
 			}
 			fz_always(ctx)
 				fz_drop_page(ctx, (fz_page *)page);
@@ -457,6 +502,7 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path,
 	{
 		fz_json *root = fz_json_new_object(ctx, pool);
 		fz_json *pages = fz_json_new_array(ctx, pool);
+		json_list page_list = json_list_of(pages);
 		int i, n = pdf_count_pages(ctx, doc);
 		for (i = 0; i < n; i++)
 		{
@@ -464,6 +510,7 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path,
 			pdf_obj *annots = pdf_dict_get(ctx, page_obj, PDF_NAME(Annots));
 			fz_json *p = fz_json_new_object(ctx, pool);
 			fz_json *list = fz_json_new_array(ctx, pool);
+			json_list entries = json_list_of(list);
 			int k, count = pdf_array_len(ctx, annots), has_markup = 0;
 
 			for (k = 0; k < count; k++)
@@ -479,7 +526,7 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path,
 				}
 				else
 					fz_json_object_set(ctx, pool, a, "dict", fz_json_new_null(ctx, pool));
-				fz_json_array_push(ctx, pool, list, a);
+				json_list_push(ctx, pool, &entries, a);
 			}
 
 			fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page_obj));
@@ -500,7 +547,7 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path,
 				fz_catch(ctx)
 					fz_rethrow(ctx);
 			}
-			fz_json_array_push(ctx, pool, pages, p);
+			json_list_push(ctx, pool, &page_list, p);
 		}
 		fz_json_object_set(ctx, pool, root, "pages", pages);
 		write_json_file(ctx, out_path, root);
@@ -733,6 +780,28 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
  * "keep" lists the indices of the page's current /Annots entries that stay (all when
  * absent); "add" appends created objects.
  */
+
+/*
+ * Loads every object once, so a broken one makes MuPDF repair the document now. A repair
+ * rebuilds the xref and drops what was changed in memory: when the save's garbage pass is
+ * the first to hit a broken object, the new /Annots are lost without an error.
+ */
+static void load_all_objects(fz_context *ctx, pdf_document *doc)
+{
+	int num;
+	for (num = 1; num < pdf_xref_len(ctx, doc); num++)
+	{
+		pdf_obj *obj = NULL;
+		fz_var(obj);
+		fz_try(ctx)
+			obj = pdf_load_object(ctx, doc, num);
+		fz_always(ctx)
+			pdf_drop_obj(ctx, obj);
+		fz_catch(ctx)
+			fz_ignore_error(ctx); /* stays broken; the save writes what it can */
+	}
+}
+
 static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_path, const char *out_path)
 {
 	pdf_document *doc = pdf_open_document(ctx, in_path);
@@ -743,7 +812,10 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 	{
 		fz_json *plan, *objects, *pages;
 		fz_json_object *o;
-		int i, n, page_count = pdf_count_pages(ctx, doc);
+		int i, n, page_count;
+
+		load_all_objects(ctx, doc);
+		page_count = pdf_count_pages(ctx, doc);
 
 		plan_buf = fz_read_file(ctx, plan_path);
 		plan = fz_parse_json(ctx, pool, fz_string_from_buffer(ctx, plan_buf));

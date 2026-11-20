@@ -56,9 +56,10 @@ class PDF:
         body = body.rstrip()[:-2] + b' /Length %d >>' % len(stream)
         return b'%d 0 obj\n%s\nstream\n%s\nendstream\nendobj\n' % (num, body, stream)
 
-    def build(self, root, xref='table', info=None, trailer=b''):
+    def build(self, root, xref='table', info=None, trailer=b'', bad_offsets=()):
         """xref: 'table', 'stream' (objects in an object stream, cross-reference stream),
-        'broken' (a table with every offset wrong) or 'none' (no table, no trailer)."""
+        'broken' (a table with every offset wrong) or 'none' (no table, no trailer).
+        bad_offsets: objects whose table offset is wrong in an otherwise correct table."""
         out = bytearray(b'%%PDF-%s\n%%\xe2\xe3\xcf\xd3\n' % self.version)
         if xref == 'stream':
             return self._build_compressed(out, root)
@@ -73,7 +74,7 @@ class PDF:
         size = max(self.objects) + 1
         out += b'xref\n0 %d\n0000000000 65535 f \n' % size
         for num in range(1, size):
-            offset = offsets[num] + (7 if xref == 'broken' else 0)
+            offset = offsets[num] + (7 if xref == 'broken' or num in bad_offsets else 0)
             out += b'%010d 00000 n \n' % offset
         out += b'trailer\n<< /Size %d /Root %s' % (size, ref(root))
         if info:
