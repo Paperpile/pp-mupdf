@@ -169,11 +169,11 @@ def append_update(data, objects, root, size):
 
 
 def simple_document(pages, page_attrs=b'', pages_attrs=b'/MediaBox [0 0 612 792]', fonts=None,
-                    catalog=b'', pdf=None):
+                    catalog=b'', pdf=None, resources=b''):
     """A document whose pages are given as (content, annots_or_None, attrs) tuples, annots
     being the raw /Annots value. Font /F1 is Helvetica (WinAnsi); fonts adds more as
-    {b'F2': object number}. Returns (pdf, root, page_numbers). Pass pdf to create objects
-    (annotations, fonts) before the pages."""
+    {b'F2': object number}, resources more /Resources entries. Returns (pdf, root,
+    page_numbers). Pass pdf to create objects (annotations, fonts) before the pages."""
     pdf = pdf or PDF()
     root = pdf.reserve()
     pages_num = pdf.reserve()
@@ -184,8 +184,8 @@ def simple_document(pages, page_attrs=b'', pages_attrs=b'/MediaBox [0 0 612 792]
     page_nums = []
     for content, annots, attrs in pages:
         content_num = pdf.add(b'<< >>', stream=content)
-        page = b'<< /Type /Page /Parent %s /Resources << /Font << %s >> >> /Contents %s' % (
-            ref(pages_num), font_dict, ref(content_num))
+        page = b'<< /Type /Page /Parent %s /Resources << /Font << %s >> %s >> /Contents %s' % (
+            ref(pages_num), font_dict, resources, ref(content_num))
         if annots is not None:
             page += b' /Annots ' + annots
         page += b' ' + (attrs or page_attrs) + b' >>'

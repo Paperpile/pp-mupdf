@@ -453,7 +453,7 @@ static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 
 static void load_all_objects(fz_context *ctx, pdf_document *doc);
 
-/* Loads every page and, on pages with highlights, their quads and the page text: the
+/* Loads every page and, on pages with text markups, their quads and the page text: the
  * work a later read does, so a document that fails here would fail there.
  *
  * With --no-repair it also fails where MuPDF had to repair the file (a broken xref, objects
@@ -480,7 +480,7 @@ static void cmd_check(fz_context *ctx, const char *in_path, int no_repair)
 				for (annot = pdf_first_annot(ctx, page); annot; annot = pdf_next_annot(ctx, annot))
 				{
 					int k, count;
-					if (pdf_annot_type(ctx, annot) != PDF_ANNOT_HIGHLIGHT)
+					if (!is_text_markup(pdf_dict_get_name(ctx, pdf_annot_obj(ctx, annot), PDF_NAME(Subtype))))
 						continue;
 					if (!text)
 						text = page_text(ctx, (fz_page *)page);
@@ -666,7 +666,7 @@ static pdf_obj *json_to_obj(fz_context *ctx, pdf_document *doc, new_objects *obj
 	if (fz_json_is_number(ctx, v))
 	{
 		double d = fz_json_to_number(ctx, v);
-		if (d == (double)(int64_t)d && d > -1e15 && d < 1e15)
+		if (d > -1e15 && d < 1e15 && d == (double)(int64_t)d)
 			return pdf_new_int(ctx, (int64_t)d);
 		return pdf_new_real(ctx, (float)d);
 	}
@@ -710,11 +710,13 @@ static pdf_obj *json_to_obj(fz_context *ctx, pdf_document *doc, new_objects *obj
 	}
 	if (fz_json_is_array(ctx, v))
 	{
-		int i, n = fz_json_array_length(ctx, v);
-		pdf_obj *arr = pdf_new_array(ctx, doc, n);
+		/* Walks the list: fz_json_array_get and _length each walk it from the start,
+		 * which made a long /InkList take seconds. */
+		fz_json_array *item;
+		pdf_obj *arr = pdf_new_array(ctx, doc, 8);
 		fz_try(ctx)
-			for (i = 0; i < n; i++)
-				pdf_array_push_drop(ctx, arr, json_to_obj(ctx, doc, objs, fz_json_array_get(ctx, v, i)));
+			for (item = v->u.array; item; item = item->next)
+				pdf_array_push_drop(ctx, arr, json_to_obj(ctx, doc, objs, item->value));
 		fz_catch(ctx)
 		{
 			pdf_drop_obj(ctx, arr);
@@ -775,14 +777,14 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
 	 * drop newly added annotations without an error. The document ID is kept, so the same
 	 * input and plan give the same bytes, and encryption is removed (as PDFBox's writer
 	 * does), which also avoids fresh random encryption values on every save. */
-	pdf_parse_write_options(ctx, &opts, "garbage,regenerate-id=no,decrypt");
+	pdf_parse_write_options(ctx, &opts, "garbage,regenerate-id=no,encrypt=none");
 	fz_try(ctx)
 		pdf_save_document(ctx, doc, out_path, &opts);
 	fz_catch(ctx)
 	{
 		fz_report_error(ctx);
 		fz_warn(ctx, "garbage-collecting save failed, saving without");
-		pdf_parse_write_options(ctx, &opts, "regenerate-id=no,decrypt");
+		pdf_parse_write_options(ctx, &opts, "regenerate-id=no,encrypt=none");
 		pdf_save_document(ctx, doc, out_path, &opts);
 	}
 }
@@ -826,7 +828,8 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 	{
 		fz_json *plan, *objects, *pages;
 		fz_json_object *o;
-		int i, n, page_count;
+		fz_json_array *page_item;
+		int i, page_count;
 
 		load_all_objects(ctx, doc);
 		page_count = pdf_count_pages(ctx, doc);
@@ -891,13 +894,15 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 			}
 		}
 
-		n = pages ? fz_json_array_length(ctx, pages) : 0;
-		for (i = 0; i < n; i++)
+		if (pages && !fz_json_is_array(ctx, pages))
+			fz_throw(ctx, FZ_ERROR_SYNTAX, "plan pages must be an array");
+		for (page_item = pages ? pages->u.array : NULL; page_item; page_item = page_item->next)
 		{
-			fz_json *p = fz_json_array_get(ctx, pages, i);
+			fz_json *p = page_item->value;
 			fz_json *keep = fz_json_object_get(ctx, p, "keep");
 			fz_json *add = fz_json_object_get(ctx, p, "add");
 			fz_json *index = fz_json_object_get(ctx, p, "index");
+			fz_json_array *item;
 			int page_index, k;
 			pdf_obj *page_obj, *old, *annots;
 
@@ -913,9 +918,9 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 			{
 				if (keep && fz_json_is_array(ctx, keep))
 				{
-					for (k = 0; k < fz_json_array_length(ctx, keep); k++)
+					for (item = keep->u.array; item; item = item->next)
 					{
-						int j = (int)fz_json_to_number(ctx, fz_json_array_get(ctx, keep, k));
+						int j = (int)fz_json_to_number(ctx, item->value);
 						if (j < 0 || j >= pdf_array_len(ctx, old))
 							fz_throw(ctx, FZ_ERROR_ARGUMENT, "page %d has no /Annots entry %d", page_index, j);
 						pdf_array_push(ctx, annots, pdf_array_get(ctx, old, j));
@@ -927,8 +932,8 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 						pdf_array_push(ctx, annots, pdf_array_get(ctx, old, k));
 				}
 				if (add && fz_json_is_array(ctx, add))
-					for (k = 0; k < fz_json_array_length(ctx, add); k++)
-						pdf_array_push_drop(ctx, annots, json_to_obj(ctx, doc, &objs, fz_json_array_get(ctx, add, k)));
+					for (item = add->u.array; item; item = item->next)
+						pdf_array_push_drop(ctx, annots, json_to_obj(ctx, doc, &objs, item->value));
 				pdf_dict_put(ctx, page_obj, PDF_NAME(Annots), annots);
 			}
 			fz_always(ctx)
@@ -1082,6 +1087,11 @@ int main(int argc, char **argv)
 	fz_try(ctx)
 	{
 		const char *cmd = argv[1];
+		/* Only render needs colour management. Setting up lcms on the first colour of a
+		 * page took most of a read (about 20 ms per process), and text extraction only
+		 * reports codepoints and positions, which colours do not change. */
+		if (strcmp(cmd, "render"))
+			fz_disable_icc(ctx);
 		if (!strcmp(cmd, "info") && argc == 4)
 			cmd_info(ctx, argv[2], argv[3]);
 		else if (!strcmp(cmd, "check") && argc == 3)

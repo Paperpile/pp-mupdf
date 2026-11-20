@@ -535,6 +535,18 @@ class ReadChars(Tool):
         chars = self.chars(self.doc(content, pdf=pdf, fonts={b'F2': font}))
         self.assertEqual(self.text_of(chars), 'TBS-­T')
 
+    def test_text_in_every_colour_space(self):
+        # read runs without colour management (only render needs it): text in calibrated,
+        # CMYK and spot colours is extracted all the same.
+        pdf = PDF()
+        tint = pdf.add(b'<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 1 0 0] /N 1 >>')
+        content = (b'BT /F1 12 Tf 72 700 Td 0 0 0 1 k (Ab) Tj /CS1 cs 1 scn (Cd) Tj '
+                   b'/CS2 cs 0.5 0.5 0.5 sc (Ef) Tj ET')
+        resources = (b'/ColorSpace << /CS1 [/Separation /Spot /DeviceCMYK %s] '
+                     b'/CS2 [/CalRGB << /WhitePoint [0.9505 1 1.089] >>] >>' % ref(tint))
+        chars = self.chars(self.doc(content, pdf=pdf, resources=resources))
+        self.assertEqual(self.text_of(chars), 'AbCdEf')
+
     def test_non_embedded_cjk_font_without_tounicode(self):
         # Ryumin-Light, Identity-H, no ToUnicode, not embedded: the Unicode values come from
         # MuPDF's Adobe-Japan1 table, which needs the CJK fallback font to be present (also in
@@ -747,6 +759,24 @@ class Write(Tool):
                                            'pages': [{'index': 2, 'add': ['@n']}]})
         pages = self.read(out)['pages']
         self.assertEqual([len(p['annots']) for p in pages], [0, 0, 1])
+
+    def test_long_ink_list(self):
+        # Building PDF arrays from the plan must take time linear in their length: an ink
+        # list of 80,000 numbers took 4 seconds, 200,000 would take half a minute.
+        points = [float(i % 500) for i in range(200000)]
+        ink = {'/Type': '/Annot', '/Subtype': '/Ink', '/Rect': [0, 0, 500, 500], '/InkList': [points]}
+        pdf, root, _ = one_page()
+        started = time.monotonic()
+        out = self.write(pdf.build(root), {'objects': {'@i': ink}, 'pages': [{'index': 0, 'add': ['@i']}]})
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(self.read(out)['pages'][0]['annots'][0]['dict']['/InkList'], [points])
+
+    def test_write_of_a_clean_file_prints_nothing(self):
+        pdf, root, _ = one_page()
+        with open(self.path('plan.json'), 'w', encoding='utf-8') as f:
+            json.dump({'objects': {'@n': text_annot('note')}, 'pages': [{'index': 0, 'add': ['@n']}]}, f)
+        result = self.ok('write', self.save(pdf.build(root)), self.path('plan.json'), self.path('out.pdf'))
+        self.assertEqual(result.stderr, b'')
 
     def test_invalid_plans_fail_and_write_nothing(self):
         data, _ = self.three_annotations()
