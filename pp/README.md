@@ -6,7 +6,10 @@ semantics: the caller decides what to read and describes everything it writes.
 
 Everything added to MuPDF lives in `pp/`. The rest of the tree is upstream MuPDF, unchanged
 except for `.gitmodules`, whose relative submodule URLs point to Artifex's GitHub repositories
-instead, and a one-line fix in `source/fitz/json.c` (the JSON parser dropped `\"`).
+instead, a one-line fix in `source/fitz/json.c` (the JSON parser dropped `\"`), and a fix in
+`source/pdf/pdf-page.c`: loading a page remembered its resource scan on the reference to a
+resource dictionary instead of on the dictionary, so a dictionary shared by many forms was
+scanned once per form (minutes per page on some LibreOffice exports).
 
 ## Commands
 

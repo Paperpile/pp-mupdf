@@ -490,14 +490,18 @@ static int
 pdf_resources_use_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up)
 {
 	pdf_cycle_list cycle;
-	pdf_obj *obj;
+	pdf_obj *obj, *memo;
 	int i, n, useBM = 0;
 
 	if (!rdb)
 		return 0;
 
-	/* Have we been here before and remembered an answer? */
-	if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, &useBM))
+	/* Have we been here before and remembered an answer? The memo goes on the dictionary,
+	 * not on the reference to it: every object that refers to a shared resource dictionary
+	 * has a reference of its own, so a memo there was never found again, and a dictionary
+	 * shared by thousands of forms was scanned once per form. */
+	memo = pdf_resolve_indirect(ctx, rdb);
+	if (pdf_obj_memo(ctx, memo, PDF_FLAGS_MEMO_BM, &useBM))
 		return useBM;
 
 	/* stop on cyclic resource dependencies */
@@ -527,7 +531,7 @@ found:
 		useBM = 1;
 	}
 
-	pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, useBM);
+	pdf_set_obj_memo(ctx, memo, PDF_FLAGS_MEMO_BM, useBM);
 	return useBM;
 }
 
@@ -570,14 +574,18 @@ static int
 pdf_resources_use_overprint(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up)
 {
 	pdf_cycle_list cycle;
-	pdf_obj *obj;
+	pdf_obj *obj, *memo;
 	int i, n, useOP = 0;
 
 	if (!rdb)
 		return 0;
 
-	/* Have we been here before and remembered an answer? */
-	if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_OP, &useOP))
+	/* Have we been here before and remembered an answer? The memo goes on the dictionary,
+	 * not on the reference to it: every object that refers to a shared resource dictionary
+	 * has a reference of its own, so a memo there was never found again, and a dictionary
+	 * shared by thousands of forms was scanned once per form. */
+	memo = pdf_resolve_indirect(ctx, rdb);
+	if (pdf_obj_memo(ctx, memo, PDF_FLAGS_MEMO_OP, &useOP))
 		return useOP;
 
 	/* stop on cyclic resource dependencies */
@@ -607,7 +615,7 @@ found:
 		useOP = 1;
 	}
 
-	pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_OP, useOP);
+	pdf_set_obj_memo(ctx, memo, PDF_FLAGS_MEMO_OP, useOP);
 	return useOP;
 }
 

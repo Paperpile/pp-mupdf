@@ -281,6 +281,24 @@ class Layouts(Tool):
         self.ok('check', self.save(data))
         self.fails('check', self.save(data), '--no-repair')
 
+    def test_resources_shared_by_many_forms(self):
+        # Loading a page scans its resources for transparency and overprint. Forms that refer
+        # to one shared resource dictionary each have a reference of their own, and MuPDF
+        # remembered the answer on the reference: the dictionary was scanned once per form
+        # (a LibreOffice export: 44,000 forms, 15,000 entries, two minutes per command).
+        n = 8000
+        pdf = PDF()
+        gs = pdf.add(b'<< /CA 0.5 >>')
+        shared = pdf.add(b'<< /ExtGState << %s >> >>' % b' '.join(b'/G%d %s' % (i, ref(gs)) for i in range(n)))
+        forms = [pdf.add(b'<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources %s >>' % ref(shared),
+                         stream=b'') for _ in range(n)]
+        xobjects = b'/XObject << %s >>' % b' '.join(b'/X%d %s' % (i, ref(f)) for i, f in enumerate(forms))
+        pdf, root, _ = one_page(pdf=pdf, resources=xobjects)
+        data = self.save(pdf.build(root))
+        started = time.monotonic()
+        self.ok('check', data, '--no-repair')
+        self.assertLess(time.monotonic() - started, 5)
+
     def repair(self, data):
         self.ok('repair', self.save(data, 'repair-in.pdf'), self.path('repaired.pdf'))
         with open(self.path('repaired.pdf'), 'rb') as f:
@@ -899,6 +917,16 @@ class Render(Tool):
         _, (pam,) = self.render(out, 0, 1)
         self.assertEqual(pixel(pam, 150, 142), (255, 0, 0, 255))
         self.assertEqual(pixel(pam, 50, 142)[3], 0)
+
+    def test_translucent_colours_are_not_premultiplied(self):
+        # The PAM holds straight colour, as MuPDF's own writer gives it: a half-transparent
+        # (0.6, 0.2, 1) fill reads back as about that colour, not as the colour times its
+        # alpha (75, 25, 126). The exact values are MuPDF's rounding.
+        pdf, root, _ = one_page(b'/GS1 gs 0.6 0.2 1 rg 100 100 200 200 re f',
+                                resources=b'/ExtGState << /GS1 << /ca 0.5 >> >>')
+        _, (pam,) = self.render(pdf.build(root), 0, 1)
+        self.assertEqual(pixel(pam, 200, 592), (152, 51, 255, 126))
+        self.assertEqual(pixel(pam, 50, 50), (0, 0, 0, 0))
 
     def test_missing_page_fails(self):
         pdf, root, _ = one_page()

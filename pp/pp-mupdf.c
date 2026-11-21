@@ -487,35 +487,31 @@ static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 
 		fz_json_object_set(ctx, pool, root, "numberOfPages", fz_json_new_number(ctx, pool, n));
 		fz_json_object_set(ctx, pool, root, "hasPageLabels", fz_json_new_boolean(ctx, pool, has_labels));
+		/* From the page objects alone: loading a page also loads its annotations and scans
+		 * its resources for transparency, none of which info reports. The bounds are what
+		 * fz_bound_page gives, the crop box through the page transform. */
 		for (i = 0; i < n; i++)
 		{
-			pdf_page *page = pdf_load_page(ctx, doc, i);
-			fz_try(ctx)
+			pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, i);
+			fz_json *p = fz_json_new_object(ctx, pool);
+			fz_rect cropbox;
+			fz_matrix ctm;
+			pdf_page_obj_transform(ctx, page_obj, &cropbox, &ctm);
+			fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page_obj));
+			fz_json_object_set(ctx, pool, p, "bounds", json_rect(ctx, pool, fz_transform_rect(cropbox, ctm)));
+			fz_json_object_set(ctx, pool, p, "transform", json_matrix(ctx, pool, ctm));
+			fz_json_object_set(ctx, pool, p, "mediaBox", page_box(ctx, pool, page_obj, PDF_NAME(MediaBox)));
+			fz_json_object_set(ctx, pool, p, "cropBox", page_box(ctx, pool, page_obj, PDF_NAME(CropBox)));
+			fz_json_object_set(ctx, pool, p, "rotate", fz_json_new_number(ctx, pool, pdf_dict_get_inheritable_int(ctx, page_obj, PDF_NAME(Rotate))));
+			if (has_labels)
 			{
-				fz_json *p = fz_json_new_object(ctx, pool);
-				fz_rect mediabox;
-				fz_matrix ctm;
-				pdf_page_transform(ctx, page, &mediabox, &ctm);
-				fz_json_object_set(ctx, pool, p, "ref", json_ref(ctx, pool, page->obj));
-				fz_json_object_set(ctx, pool, p, "bounds", json_rect(ctx, pool, fz_bound_page(ctx, (fz_page *)page)));
-				fz_json_object_set(ctx, pool, p, "transform", json_matrix(ctx, pool, ctm));
-				fz_json_object_set(ctx, pool, p, "mediaBox", page_box(ctx, pool, page->obj, PDF_NAME(MediaBox)));
-				fz_json_object_set(ctx, pool, p, "cropBox", page_box(ctx, pool, page->obj, PDF_NAME(CropBox)));
-				fz_json_object_set(ctx, pool, p, "rotate", fz_json_new_number(ctx, pool, pdf_dict_get_inheritable_int(ctx, page->obj, PDF_NAME(Rotate))));
-				if (has_labels)
-				{
-					char label[256];
-					pdf_page_label(ctx, doc, i, label, sizeof label);
-					fz_json_object_set(ctx, pool, p, "label", fz_json_new_string(ctx, pool, label));
-				}
-				else
-					fz_json_object_set(ctx, pool, p, "label", fz_json_new_null(ctx, pool));
-				json_list_push(ctx, pool, &page_list, p);
+				char label[256];
+				pdf_page_label(ctx, doc, i, label, sizeof label);
+				fz_json_object_set(ctx, pool, p, "label", fz_json_new_string(ctx, pool, label));
 			}
-			fz_always(ctx)
-				fz_drop_page(ctx, (fz_page *)page);
-			fz_catch(ctx)
-				fz_rethrow(ctx);
+			else
+				fz_json_object_set(ctx, pool, p, "label", fz_json_new_null(ctx, pool));
+			json_list_push(ctx, pool, &page_list, p);
 		}
 		fz_json_object_set(ctx, pool, root, "pages", pages);
 		write_json_file(ctx, out_path, root);
@@ -1100,6 +1096,56 @@ static void cmd_repair(fz_context *ctx, const char *in_path, const char *out_pat
 
 /* ---- render ----------------------------------------------------------------- */
 
+/* fz_save_pixmap_as_pam, byte for byte, for the RGBA pixmaps render makes. MuPDF's writer
+ * divides once per pixel to un-premultiply and writes 720 bytes at a time, which took about
+ * as long as drawing the page; this looks the factor up, skips opaque pixels (the factor is
+ * 1 there) and writes whole rows. It un-premultiplies the samples in place. */
+static void save_rgba_pam(fz_context *ctx, fz_pixmap *pix, const char *path)
+{
+	fz_output *out;
+	unsigned char *row;
+	int inva[256], x, y, a;
+
+	if (pix->n != 4 || !pix->alpha || pix->s || !fz_colorspace_is_rgb(ctx, pix->colorspace))
+	{
+		fz_save_pixmap_as_pam(ctx, pix, path);
+		return;
+	}
+	for (a = 0; a < 256; a++)
+		inva[a] = a ? 256 * 255 / a : 0;
+	for (y = 0, row = pix->samples; y < pix->h; y++, row += pix->stride)
+	{
+		unsigned char *p = row;
+		for (x = 0; x < pix->w; x++, p += 4)
+		{
+			a = p[3];
+			if (a != 255)
+			{
+				int k = inva[a];
+				p[0] = (p[0] * k + 128) >> 8;
+				p[1] = (p[1] * k + 128) >> 8;
+				p[2] = (p[2] * k + 128) >> 8;
+			}
+		}
+	}
+
+	out = fz_new_output_with_path(ctx, path, 0);
+	fz_try(ctx)
+	{
+		fz_write_printf(ctx, out, "P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", pix->w, pix->h);
+		if (pix->stride == (ptrdiff_t)pix->w * 4)
+			fz_write_data(ctx, out, pix->samples, (size_t)pix->h * pix->stride);
+		else
+			for (y = 0, row = pix->samples; y < pix->h; y++, row += pix->stride)
+				fz_write_data(ctx, out, row, (size_t)pix->w * 4);
+		fz_close_output(ctx, out);
+	}
+	fz_always(ctx)
+		fz_drop_output(ctx, out);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
 /* The whole page at each scale, RGBA with a transparent background, in page space
  * (rotation applied, crop box at the origin, y down). info.json gets the bounds and the
  * transform from PDF space, so the caller can crop annotation thumbnails out of it. */
@@ -1125,7 +1171,7 @@ static void cmd_render(fz_context *ctx, int argc, char **argv)
 			float scale = (float)atof(argv[i]);
 			fz_pixmap *pix = fz_new_pixmap_from_page(ctx, (fz_page *)page, fz_scale(scale, scale), fz_device_rgb(ctx), 1);
 			fz_try(ctx)
-				fz_save_pixmap_as_pam(ctx, pix, argv[i + 1]);
+				save_rgba_pam(ctx, pix, argv[i + 1]);
 			fz_always(ctx)
 				fz_drop_pixmap(ctx, pix);
 			fz_catch(ctx)
