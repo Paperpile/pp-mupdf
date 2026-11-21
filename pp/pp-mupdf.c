@@ -349,9 +349,87 @@ static fz_stext_page *page_text(fz_context *ctx, fz_page *page)
 	return text;
 }
 
+/* How far outside a quad a character may start and still be kept. The markup-text code
+ * reaches 1pt left of a quad and rounds quad points to one decimal; the rest is slack. */
+#define QUAD_PAD 2
+
+/* Where the page's text markups can take characters from: each quad's bounds in page space,
+ * padded, as the markup-text code (markupText.ts) builds its regions. Sets *all when a quad
+ * is not plain numbers, which that code reads differently; the caller then keeps every line. */
+static fz_rect *markup_regions(fz_context *ctx, pdf_obj *annots, fz_matrix ctm, int *n, int *all)
+{
+	fz_rect *regions = NULL;
+	int k, i, j, count = pdf_array_len(ctx, annots), cap = 0;
+
+	*n = 0;
+	*all = 0;
+	fz_var(regions);
+	fz_try(ctx)
+	{
+		for (k = 0; k < count && !*all; k++)
+		{
+			pdf_obj *entry = pdf_array_get(ctx, annots, k), *qp;
+			int len;
+			if (!pdf_is_dict(ctx, entry) || !is_text_markup(pdf_dict_get_name(ctx, entry, PDF_NAME(Subtype))))
+				continue;
+			qp = pdf_dict_get(ctx, entry, PDF_NAME(QuadPoints));
+			if (pdf_is_indirect(ctx, qp))
+			{
+				*all = 1;
+				break;
+			}
+			if (!pdf_is_array(ctx, qp))
+				continue;
+			len = pdf_array_len(ctx, qp);
+			for (i = 0; i < len; i++)
+			{
+				pdf_obj *v = pdf_array_get(ctx, qp, i);
+				if (pdf_is_indirect(ctx, v) || !pdf_is_number(ctx, v))
+					*all = 1;
+			}
+			for (i = 0; i + 8 <= len && !*all; i += 8)
+			{
+				fz_rect r = fz_empty_rect;
+				for (j = 0; j < 8; j += 2)
+				{
+					fz_point pt = fz_transform_point_xy(pdf_array_get_real(ctx, qp, i + j), pdf_array_get_real(ctx, qp, i + j + 1), ctm);
+					r = fz_include_point_in_rect(r, pt);
+				}
+				if (*n == cap)
+				{
+					cap = cap ? cap * 2 : 16;
+					regions = fz_realloc_array(ctx, regions, cap, fz_rect);
+				}
+				regions[(*n)++] = fz_expand_rect(r, QUAD_PAD);
+			}
+		}
+	}
+	fz_catch(ctx)
+	{
+		fz_free(ctx, regions);
+		fz_rethrow(ctx);
+	}
+	return regions;
+}
+
+static int line_in_regions(fz_stext_line *line, const fz_rect *regions, int n)
+{
+	fz_stext_char *ch;
+	int i;
+	for (ch = line->first_char; ch; ch = ch->next)
+		for (i = 0; i < n; i++)
+			if (fz_is_point_inside_rect(ch->origin, regions[i]))
+				return 1;
+	return 0;
+}
+
 /* The page's characters in page space: [codepoint, originX, originY, line] each, the
- * line counter increasing per structured-text line, as the markup-text code expects. */
-static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page)
+ * line counter increasing per structured-text line, as the markup-text code expects.
+ * Only lines with a character in one of the regions are written, unless all is set: the
+ * markup-text code takes characters inside a quad and looks at their neighbours on the same
+ * line, so other lines cannot change its result. Most of a page is such lines, and writing
+ * them made reading and parsing the JSON a large part of a read. */
+static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page, const fz_rect *regions, int n, int all)
 {
 	fz_stext_page *text;
 	fz_stext_block *block;
@@ -371,6 +449,8 @@ static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page)
 			for (line = block->u.t.first_line; line; line = line->next)
 			{
 				line_no++;
+				if (!all && !line_in_regions(line, regions, n))
+					continue;
 				for (ch = line->first_char; ch; ch = ch->next)
 				{
 					fz_json *c = fz_json_new_array(ctx, pool);
@@ -548,16 +628,23 @@ static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path,
 			if (has_markup && with_chars)
 			{
 				pdf_page *page = pdf_load_page(ctx, doc, i);
+				fz_rect *regions = NULL;
+				fz_var(regions);
 				fz_try(ctx)
 				{
 					fz_rect mediabox;
 					fz_matrix ctm;
+					int nregions, all;
 					pdf_page_transform(ctx, page, &mediabox, &ctm);
+					regions = markup_regions(ctx, annots, ctm, &nregions, &all);
 					fz_json_object_set(ctx, pool, p, "transform", json_matrix(ctx, pool, ctm));
-					fz_json_object_set(ctx, pool, p, "chars", page_chars(ctx, pool, (fz_page *)page));
+					fz_json_object_set(ctx, pool, p, "chars", page_chars(ctx, pool, (fz_page *)page, regions, nregions, all));
 				}
 				fz_always(ctx)
+				{
+					fz_free(ctx, regions);
 					fz_drop_page(ctx, (fz_page *)page);
+				}
 				fz_catch(ctx)
 					fz_rethrow(ctx);
 			}

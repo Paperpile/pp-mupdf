@@ -25,8 +25,9 @@ TOOL = os.path.abspath(os.environ.get('PP_MUPDF', 'build/release/pp-mupdf'))
 KEEP = os.environ.get('PP_TEST_PDFS')
 
 HELLO_WORLD = text_content([b'Hello', b'World'])
-HIGHLIGHT = (b'<< /Type /Annot /Subtype /Highlight /Rect [70 690 200 715] '
-             b'/QuadPoints [70 715 200 715 70 690 200 690] /C [1 1 0] >>')
+# Over both lines of HELLO_WORLD (baselines at 700 and 680), so read reports both.
+HIGHLIGHT = (b'<< /Type /Annot /Subtype /Highlight /Rect [70 670 200 715] '
+             b'/QuadPoints [70 715 200 715 70 670 200 670] /C [1 1 0] >>')
 
 
 def apply(m, x, y):
@@ -369,7 +370,8 @@ class ReadAnnotations(Tool):
     def test_page_with_many_characters(self):
         # A dense page (once 64 seconds) must not take time quadratic in its characters.
         pdf = PDF()
-        highlight = pdf.add(HIGHLIGHT)
+        highlight = pdf.add(b'<< /Type /Annot /Subtype /Highlight /Rect [0 0 612 792] '
+                            b'/QuadPoints [0 792 612 792 0 0 612 0] >>')
         lines = [b'x' * 200] * 600
         pdf, root, _ = one_page(content=text_content(lines, size=1, leading=1),
                                 annots=b'[%s]' % ref(highlight), pdf=pdf)
@@ -493,6 +495,7 @@ class ReadChars(Tool):
     def test_origins_follow_page_rotation(self):
         data = self.doc(pages_attrs=b'/MediaBox [0 0 612 792] /Rotate 90')
         page = self.read(data)['pages'][0]
+        self.assertEqual(self.text_of(page['chars']), 'HelloWorld')
         expected = apply(page['transform'], 72, 700)
         self.assertAlmostEqual(page['chars'][0][1], expected[0], places=2)
         self.assertAlmostEqual(page['chars'][0][2], expected[1], places=2)
@@ -508,6 +511,61 @@ class ReadChars(Tool):
                             b'/Contents (NOTE) /DA (/Helv 10 Tf 0 g) /AP << /N %s >> >>' % ref(ap))
         chars = self.chars(self.doc(annots_extra=ref(free_text), pdf=pdf))
         self.assertEqual(self.text_of(chars), 'HelloWorld')
+
+    def markup(self, quads, subtype=b'Highlight'):
+        return b'<< /Type /Annot /Subtype /%s /Rect [0 0 612 792] /QuadPoints %s >>' % (subtype, quads)
+
+    def chars_under(self, *markups, content=text_content([b'One', b'Two', b'Three', b'Four'])):
+        pdf = PDF()
+        refs = b' '.join(ref(pdf.add(m)) for m in markups)
+        pdf, root, _ = one_page(content, annots=b'[%s]' % refs, pdf=pdf)
+        return self.chars(pdf.build(root))
+
+    def test_only_lines_under_a_quad(self):
+        # The markup text comes from characters inside a quad and their neighbours on the
+        # same line, so read leaves out every other line; the line numbers stay the page's.
+        # Baselines: One 700, Two 680, Three 660, Four 640.
+        chars = self.chars_under(self.markup(b'[78 688 84 688 78 676 84 676]'))
+        self.assertEqual(self.text_of(chars), 'Two')
+        self.assertEqual([c[3] for c in chars], [2, 2, 2])
+
+    def test_whole_line_when_a_quad_covers_part_of_it(self):
+        chars = self.chars_under(self.markup(b'[70 668 80 668 70 656 80 656]'))
+        self.assertEqual(self.text_of(chars), 'Three')
+
+    def test_quads_of_every_markup_and_quad(self):
+        chars = self.chars_under(
+            self.markup(b'[70 708 80 708 70 696 80 696 70 648 80 648 70 636 80 636]'),
+            self.markup(b'[70 668 80 668 70 656 80 656]', b'Squiggly'),
+            self.markup(b'[70 688 80 688 70 676 80 676]', b'Link'))
+        self.assertEqual(self.text_of(chars), 'OneThreeFour')
+
+    def test_quads_follow_page_rotation(self):
+        pdf = PDF()
+        highlight = pdf.add(self.markup(b'[70 688 80 688 70 676 80 676]'))
+        pdf, root, _ = one_page(text_content([b'One', b'Two', b'Three']), annots=b'[%s]' % ref(highlight),
+                                pdf=pdf, pages_attrs=b'/MediaBox [0 0 612 792] /Rotate 90')
+        self.assertEqual(self.text_of(self.chars(pdf.build(root))), 'Two')
+
+    def test_no_usable_quads_no_chars(self):
+        self.assertEqual(self.chars_under(self.markup(b'/None'), self.markup(b'[70 688 80]')), [])
+
+    def test_unusual_quad_values_keep_every_line(self):
+        # The markup-text code reads a reference or a non-number in /QuadPoints its own way
+        # (as 0, or not at all), so such quads keep the whole page.
+        for quads in (b'[70 688 80 688 70 676 80 /X]', b'[70 688 80 688 70 676 80 %s]'):
+            with self.subTest(quads=quads):
+                pdf = PDF()
+                if b'%s' in quads:
+                    quads = quads % ref(pdf.add(b'676'))
+                highlight = pdf.add(self.markup(quads))
+                pdf, root, _ = one_page(text_content([b'One', b'Two']), annots=b'[%s]' % ref(highlight), pdf=pdf)
+                self.assertEqual(self.text_of(self.chars(pdf.build(root))), 'OneTwo')
+        pdf = PDF()
+        quads = pdf.add(b'[70 688 80 688 70 676 80 676]')
+        highlight = pdf.add(self.markup(ref(quads)))
+        pdf, root, _ = one_page(text_content([b'One', b'Two']), annots=b'[%s]' % ref(highlight), pdf=pdf)
+        self.assertEqual(self.text_of(self.chars(pdf.build(root))), 'OneTwo')
 
     def test_ligature_glyph_becomes_two_characters(self):
         # The "fi" glyph (via /Differences) comes back as f + i, never as U+FB01 or a gap.
