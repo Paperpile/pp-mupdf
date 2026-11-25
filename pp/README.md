@@ -20,6 +20,11 @@ scanned once per form (minutes per page on some LibreOffice exports).
     pp-mupdf write  <in.pdf> <plan.json> <out.pdf>
     pp-mupdf repair <in.pdf> <out.pdf>
     pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]
+    pp-mupdf compose <doc.pdf> <summary.pdf> <plan.json> <out.pdf>
+
+`compose` makes the print and summary PDFs of a document's annotations without rasterising:
+it bakes doc's annotations into its pages, appends summary's pages, and draws the page region
+the plan gives for each `pp-thumb:<key>` link of the summary into that link, as vector content.
 
 The exit code is the only failure signal; errors go to stderr. PDF objects in JSON follow
 qpdf's JSON v2 conventions (`"/Name"`, `"u:text"`, `"b:hex"`, `"12 0 R"`), plus `"@id"` for

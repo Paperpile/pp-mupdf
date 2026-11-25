@@ -933,5 +933,205 @@ class Render(Tool):
         self.fails('render', self.save(pdf.build(root)), '3', self.path('i.json'), '1', self.path('p.pam'))
 
 
+# ---- compose --------------------------------------------------------------------------------
+
+# A red square drawn only by an annotation appearance: in the composed output it must come from
+# the baked page, since the annotation itself is gone.
+RED_SQUARE = (b'<< /Type /Annot /Subtype /Square /F 4 /Rect [100 600 200 700] '
+              b'/AP << /N %d 0 R >> >>')
+
+
+def red_square_document(page_attrs=b''):
+    pdf = PDF()
+    ap = pdf.add(b'<< /Type /XObject /Subtype /Form /BBox [100 600 200 700] >>',
+                 stream=b'1 0 0 rg 100 600 100 100 re f')
+    square = pdf.add(RED_SQUARE % ap)
+    popup = pdf.add(b'<< /Type /Annot /Subtype /Popup /F 28 /Rect [300 500 480 620] >>')
+    link = pdf.add(b'<< /Type /Annot /Subtype /Link /Rect [72 72 144 90] '
+                   b'/A << /S /URI /URI (https://example.org/) >> >>')
+    annots = b'[%s %s %s]' % (ref(square), ref(popup), ref(link))
+    return simple_document([(b'', annots, page_attrs or None)], pdf=pdf)
+
+
+def link(uri, rect):
+    return b'<< /Type /Annot /Subtype /Link /Rect [%d %d %d %d] /A << /S /URI /URI (%s) >> >>' % (
+        *rect, uri)
+
+
+def summary_document(links, content=b'0.9 g 0 0 612 792 re f'):
+    """One grey page with the given (uri, rect) link annotations, as Chrome writes them."""
+    pdf = PDF()
+    nums = [pdf.add(link(uri, rect)) for uri, rect in links]
+    annots = b'[%s]' % b' '.join(ref(n) for n in nums)
+    return simple_document([(content, annots, None)], pdf=pdf)
+
+
+def page_rect(info_page, pdf_rect):
+    """A PDF-space rect in page space (top-left origin, /Rotate applied), as the backend
+    computes thumbnail regions from info's transform."""
+    xs, ys = zip(*(apply(info_page['transform'], x, y)
+                   for x in pdf_rect[0::2] for y in pdf_rect[1::2]))
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+class Compose(Tool):
+    def compose(self, doc, summary, plan, expect_ok=True):
+        args = (self.save(doc, 'doc.pdf'), self.save(summary, 'summary.pdf'), self.path('plan.json'),
+                self.path('out.pdf'))
+        with open(self.path('plan.json'), 'w', encoding='utf-8') as f:
+            json.dump(plan, f)
+        if not expect_ok:
+            return self.fails('compose', *args)
+        self.ok('compose', *args)
+        with open(self.path('out.pdf'), 'rb') as f:
+            return f.read()
+
+    def render_page(self, data, page, scale=1):
+        pdf = self.save(data, 'render-%d.pdf' % page)
+        self.ok('render', pdf, str(page), self.path('r.json'), str(scale), self.path('r.pam'))
+        return read_pam(self.path('r.pam'))
+
+    def subtypes(self, data, page):
+        return [a['dict'].get('/Subtype') for a in self.read(data)['pages'][page]['annots']]
+
+    def uris(self, data, page):
+        return [a['dict']['/A']['/URI'] for a in self.read(data)['pages'][page]['annots']
+                if '/A' in a['dict']]
+
+    def test_appends_summary_after_baked_document(self):
+        pdf, root, _ = red_square_document()
+        doc = pdf.build(root)
+        spdf, sroot, _ = summary_document([(b'https://example.com/', (72, 72, 200, 90))])
+        out = self.compose(doc, spdf.build(sroot), {'keepDocument': True, 'thumbnails': {}})
+        self.assertEqual(self.info(out)['numberOfPages'], 2)
+        # The square and its popup are baked into the page; the document's link stays a link.
+        self.assertEqual(self.subtypes(out, 0), ['/Link'])
+        self.assertEqual(pixel(self.render_page(out, 0), 150, 142), (255, 0, 0, 255))
+        self.assertEqual(self.uris(out, 1), ['u:https://example.com/'])
+
+    def test_thumbnail_link_becomes_the_page_region(self):
+        pdf, root, _ = red_square_document()
+        doc = pdf.build(root)
+        region = page_rect(self.info(doc)['pages'][0], [100, 600, 200, 700])
+        spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400)),
+                                           (b'https://example.com/', (72, 72, 200, 90))])
+        out = self.compose(doc, spdf.build(sroot),
+                           {'keepDocument': True, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
+        self.assertEqual(self.uris(out, 1), ['u:https://example.com/'])
+        pam = self.render_page(out, 1)
+        self.assertEqual(pixel(pam, 350, 442), (255, 0, 0, 255), 'the baked square, inside the link')
+        self.assertEqual(pixel(pam, 250, 442)[:3], (229, 229, 229), 'the summary page, outside')
+
+    def test_without_keep_document_only_the_summary_remains(self):
+        pdf, root, _ = red_square_document()
+        doc = pdf.build(root)
+        region = page_rect(self.info(doc)['pages'][0], [100, 600, 200, 700])
+        spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))])
+        out = self.compose(doc, spdf.build(sroot),
+                           {'keepDocument': False, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
+        self.assertEqual(self.info(out)['numberOfPages'], 1)
+        self.assertEqual(self.subtypes(out, 0), [])
+        self.assertEqual(pixel(self.render_page(out, 0), 350, 442), (255, 0, 0, 255))
+
+    def test_region_keeps_its_orientation_on_rotated_and_cropped_pages(self):
+        # Four colours in the corners of the region: the stamp must show them where a render
+        # of the source page shows them, whatever /Rotate and the crop box do.
+        quads = (b'1 0 0 rg 100 650 50 50 re f 0 1 0 rg 150 650 50 50 re f '
+                 b'0 0 1 rg 100 600 50 50 re f 1 1 0 rg 150 600 50 50 re f')
+        for attrs in (b'/Rotate 90', b'/Rotate 180', b'/Rotate 270',
+                      b'/CropBox [50 500 400 760] /Rotate 90'):
+            with self.subTest(attrs=attrs):
+                pdf, root, _ = simple_document([(quads, None, b'/MediaBox [0 0 612 792] ' + attrs)])
+                doc = pdf.build(root)
+                region = page_rect(self.info(doc)['pages'][0], [100, 600, 200, 700])
+                spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))])
+                out = self.compose(doc, spdf.build(sroot),
+                                   {'keepDocument': False, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
+                source, stamped = self.render_page(doc, 0), self.render_page(out, 0)
+                for u, v in ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)):
+                    sx = int(region[0] + u * (region[2] - region[0]))
+                    sy = int(region[1] + v * (region[3] - region[1]))
+                    self.assertEqual(pixel(stamped, int(300 + u * 100), int(392 + v * 100))[:3],
+                                     pixel(source, sx, sy)[:3], (u, v))
+
+    def test_region_is_fitted_into_the_link_centred(self):
+        # A 100 x 50 region in a 100 x 100 link: full width, centred vertically, the rest of
+        # the link shows the summary page.
+        pdf, root, _ = simple_document([(b'1 0 0 rg 100 650 100 50 re f', None, None)])
+        doc = pdf.build(root)
+        region = page_rect(self.info(doc)['pages'][0], [100, 650, 200, 700])
+        spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))])
+        out = self.compose(doc, spdf.build(sroot),
+                           {'keepDocument': False, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
+        pam = self.render_page(out, 0)
+        self.assertEqual(pixel(pam, 350, 442)[:3], (255, 0, 0))
+        self.assertEqual(pixel(pam, 350, 400)[:3], (229, 229, 229))
+        self.assertEqual(pixel(pam, 350, 485)[:3], (229, 229, 229))
+
+    def test_unknown_thumbnail_key_drops_the_link(self):
+        pdf, root, _ = red_square_document()
+        spdf, sroot, _ = summary_document([(b'pp-thumb:missing', (300, 300, 400, 400))])
+        out = self.compose(pdf.build(root), spdf.build(sroot), {'keepDocument': False, 'thumbnails': {}})
+        self.assertEqual(self.subtypes(out, 0), [])
+        self.assertEqual(pixel(self.render_page(out, 0), 350, 442)[:3], (229, 229, 229))
+
+    def test_summary_drawing_state_does_not_leak_into_the_stamp(self):
+        # Chrome's content scales and leaves a q open; the stamp must still land on the link.
+        pdf, root, _ = red_square_document()
+        doc = pdf.build(root)
+        region = page_rect(self.info(doc)['pages'][0], [100, 600, 200, 700])
+        spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))],
+                                          content=b'0.9 g 0 0 612 792 re f q 0.5 0 0 0.5 0 0 cm')
+        out = self.compose(doc, spdf.build(sroot),
+                           {'keepDocument': False, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
+        self.assertEqual(pixel(self.render_page(out, 0), 350, 442), (255, 0, 0, 255))
+
+    def test_baked_appearance_loses_a_plain_transparency_group(self):
+        # A highlight's Multiply inside a transparency group: once baked, poppler's Cairo
+        # backend (Evince) draws the group as isolated and the highlight covers the text.
+        # A non-isolated, non-knockout group around one appearance changes nothing on the
+        # page, so it goes; an isolated or knockout one stays.
+        # The colour where the highlight meets the blue square: Multiply of yellow over blue
+        # is black, unless the group is isolated, which by the spec blends against nothing.
+        for group, kept, colour in ((b'<< /S /Transparency >>', False, (0, 0, 0)),
+                                    (b'<< /S /Transparency /I true >>', True, (255, 255, 0)),
+                                    (b'<< /S /Transparency /K true >>', True, (0, 0, 0))):
+            with self.subTest(group=group):
+                pdf = PDF()
+                ap = pdf.add(b'<< /Type /XObject /Subtype /Form /BBox [100 600 200 700] /Group %s '
+                             b'/Resources << /ExtGState << /M << /BM /Multiply >> >> >> >>' % group,
+                             stream=b'/M gs 1 1 0 rg 100 600 100 100 re f')
+                hl = pdf.add(b'<< /Type /Annot /Subtype /Highlight /F 4 /Rect [100 600 200 700] '
+                             b'/QuadPoints [100 700 200 700 100 600 200 600] /AP << /N %d 0 R >> >>' % ap)
+                pdf, root, _ = simple_document([(b'0 0 1 rg 120 620 60 60 re f', b'[%s]' % ref(hl), None)], pdf=pdf)
+                spdf, sroot, _ = summary_document([])
+                out = self.compose(pdf.build(root), spdf.build(sroot), {'keepDocument': True, 'thumbnails': {}})
+                self.assertEqual(b'/Group' in out, kept)
+                self.assertEqual(pixel(self.render_page(out, 0), 150, 142)[:3], colour)
+
+    def test_thumbnail_page_out_of_range_fails(self):
+        pdf, root, _ = red_square_document()
+        spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))])
+        self.compose(pdf.build(root), spdf.build(sroot),
+                     {'keepDocument': False, 'thumbnails': {'a': {'page': 5, 'rect': [0, 0, 10, 10]}}},
+                     expect_ok=False)
+        self.assertFalse(os.path.exists(self.path('out.pdf')))
+
+    def test_on_test_pdf_sized_input_it_is_fast(self):
+        # 40 pages, 2 thumbnails each, on an 80-page summary: well under a second.
+        quads = b'1 0 0 rg 100 600 100 100 re f'
+        pdf, root, _ = simple_document([(quads, None, None)] * 40)
+        doc = pdf.build(root)
+        page0 = self.info(doc)['pages'][0]
+        region = page_rect(page0, [100, 600, 200, 700])
+        links = [(b'pp-thumb:t%d' % i, (300, 100 + 300 * (i % 2), 400, 200 + 300 * (i % 2))) for i in range(80)]
+        spdf, sroot, _ = summary_document(links)
+        plan = {'keepDocument': True,
+                'thumbnails': {'t%d' % i: {'page': i // 2, 'rect': region} for i in range(80)}}
+        start = time.monotonic()
+        self.compose(doc, spdf.build(sroot), plan)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+
 if __name__ == '__main__':
     unittest.main()
