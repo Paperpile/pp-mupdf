@@ -25,7 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PP_MUPDF_VERSION "0.1.0"
+#define PP_MUPDF_VERSION "0.2.0"
 #define MAX_DEPTH 8
 
 static void usage(void)
@@ -38,7 +38,8 @@ static void usage(void)
 		"  pp-mupdf read   <in.pdf> <out.json> [--no-chars]\n"
 		"  pp-mupdf write  <in.pdf> <plan.json> <out.pdf>\n"
 		"  pp-mupdf repair <in.pdf> <out.pdf>\n"
-		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n");
+		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n"
+		"  pp-mupdf compose <doc.pdf> <summary.pdf> <plan.json> <out.pdf>\n");
 }
 
 /* ---- JSON output helpers ------------------------------------------------- */
@@ -1192,6 +1193,382 @@ static void cmd_render(fz_context *ctx, int argc, char **argv)
 		fz_rethrow(ctx);
 }
 
+/* ---- compose ---------------------------------------------------------------- */
+
+/*
+ * The print and summary PDFs of a document's annotations, without rasterising anything:
+ *
+ *   pp-mupdf compose <doc.pdf> <summary.pdf> <plan.json> <out.pdf>
+ *   plan: { "keepDocument": true,
+ *           "thumbnails": { "<key>": { "page": 3, "rect": [x0, y0, x1, y1] }, ... } }
+ *
+ * 1. doc's annotations and form fields are baked into its page content (links stay links),
+ *    so the output prints them whatever the viewer does with annotations.
+ * 2. summary's pages (the annotation list Chrome rendered) are appended.
+ * 3. Every link on those pages whose URI is "pp-thumb:<key>" is a placeholder: it is removed,
+ *    and the region "rect" of doc page "page" is drawn into its rect, fitted and centred, on
+ *    white. The region is in page space as `info` reports it (/Rotate applied, crop box at
+ *    the origin, y down), the space the thumbnails were cropped from as images. The page is
+ *    drawn as a form XObject of its content, so the thumbnail stays vector and costs nothing
+ *    to make. A key the plan does not list only drops the link.
+ * 4. Without keepDocument, doc's own pages are deleted (the summary alone), the forms keep
+ *    what the thumbnails need.
+ */
+
+typedef struct
+{
+	const char *key;
+	int page;
+	fz_rect rect;
+} thumbnail;
+
+static thumbnail *parse_thumbnails(fz_context *ctx, fz_json *thumbnails, int page_count, int *n)
+{
+	thumbnail *list;
+	fz_json_object *o;
+	int i = 0;
+
+	*n = 0;
+	if (!thumbnails)
+		return NULL;
+	if (!fz_json_is_object(ctx, thumbnails))
+		fz_throw(ctx, FZ_ERROR_SYNTAX, "plan thumbnails must be an object");
+	for (o = thumbnails->u.object; o; o = o->next)
+		(*n)++;
+	list = fz_malloc_array(ctx, *n, thumbnail);
+	fz_try(ctx)
+	{
+		for (o = thumbnails->u.object; o; o = o->next, i++)
+		{
+			fz_json *page = fz_json_object_get(ctx, o->value, "page");
+			fz_json *rect = fz_json_object_get(ctx, o->value, "rect");
+			if (!page || !fz_json_is_number(ctx, page) || !rect || fz_json_array_length(ctx, rect) != 4)
+				fz_throw(ctx, FZ_ERROR_SYNTAX, "thumbnail %s needs a page and a rect", o->key);
+			list[i].key = o->key;
+			list[i].page = (int)fz_json_to_number(ctx, page);
+			if (list[i].page < 0 || list[i].page >= page_count)
+				fz_throw(ctx, FZ_ERROR_ARGUMENT, "thumbnail %s: page %d out of range", o->key, list[i].page);
+			list[i].rect = fz_make_rect(
+				(float)fz_json_to_number(ctx, fz_json_array_get(ctx, rect, 0)),
+				(float)fz_json_to_number(ctx, fz_json_array_get(ctx, rect, 1)),
+				(float)fz_json_to_number(ctx, fz_json_array_get(ctx, rect, 2)),
+				(float)fz_json_to_number(ctx, fz_json_array_get(ctx, rect, 3)));
+			if (fz_is_empty_rect(list[i].rect))
+				fz_throw(ctx, FZ_ERROR_ARGUMENT, "thumbnail %s: empty rect", o->key);
+		}
+	}
+	fz_catch(ctx)
+	{
+		fz_free(ctx, list);
+		fz_rethrow(ctx);
+	}
+	return list;
+}
+
+static const thumbnail *find_thumbnail(const thumbnail *list, int n, const char *key)
+{
+	int i;
+	for (i = 0; i < n; i++)
+		if (!strcmp(list[i].key, key))
+			return &list[i];
+	return NULL;
+}
+
+/* Every content stream of the page joined into one, balanced, for a form XObject. */
+static fz_buffer *page_content(fz_context *ctx, pdf_document *doc, pdf_obj *page_obj, pdf_obj *res)
+{
+	pdf_obj *contents = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
+	fz_buffer *buf = fz_new_buffer(ctx, 4096);
+	fz_buffer *part = NULL;
+	int prepend, append, i, n;
+
+	fz_var(part);
+	fz_try(ctx)
+	{
+		pdf_count_q_balance(ctx, doc, res, contents, &prepend, &append);
+		while (prepend-- > 0)
+			fz_append_string(ctx, buf, "q\n");
+		n = pdf_is_array(ctx, contents) ? pdf_array_len(ctx, contents) : 1;
+		for (i = 0; i < n; i++)
+		{
+			pdf_obj *stm = pdf_is_array(ctx, contents) ? pdf_array_get(ctx, contents, i) : contents;
+			if (!pdf_is_stream(ctx, stm))
+				continue;
+			part = pdf_load_stream(ctx, stm);
+			fz_append_buffer(ctx, buf, part);
+			fz_append_byte(ctx, buf, '\n');
+			fz_drop_buffer(ctx, part);
+			part = NULL;
+		}
+		while (append-- > 0)
+			fz_append_string(ctx, buf, "Q\n");
+	}
+	fz_catch(ctx)
+	{
+		fz_drop_buffer(ctx, part);
+		fz_drop_buffer(ctx, buf);
+		fz_rethrow(ctx);
+	}
+	return buf;
+}
+
+/* The form XObject that draws doc page `index` as it is, made once per page. */
+static pdf_obj *page_form(fz_context *ctx, pdf_document *doc, pdf_obj **forms, int index)
+{
+	if (!forms[index])
+	{
+		pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, index);
+		pdf_obj *res = pdf_dict_get_inheritable(ctx, page_obj, PDF_NAME(Resources));
+		fz_rect cropbox;
+		fz_matrix ctm;
+		fz_buffer *buf;
+
+		pdf_page_obj_transform(ctx, page_obj, &cropbox, &ctm);
+		buf = page_content(ctx, doc, page_obj, res);
+		fz_try(ctx)
+			forms[index] = pdf_new_xobject(ctx, doc, cropbox, fz_identity, res, buf);
+		fz_always(ctx)
+			fz_drop_buffer(ctx, buf);
+		fz_catch(ctx)
+			fz_rethrow(ctx);
+	}
+	return forms[index];
+}
+
+/* The drawing that puts thumbnail `t` into `link` (PDF space of the summary page). */
+static void draw_thumbnail(fz_context *ctx, pdf_document *doc, fz_buffer *buf, pdf_obj *xobjects,
+	pdf_obj **forms, const thumbnail *t, fz_rect link)
+{
+	pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, t->page);
+	fz_rect cropbox, r = t->rect;
+	fz_matrix ctm, m;
+	float rw = r.x1 - r.x0, rh = r.y1 - r.y0;
+	float lw = link.x1 - link.x0, lh = link.y1 - link.y0;
+	float s = fz_min(lw / rw, lh / rh);
+	float w = rw * s, h = rh * s;
+	float x0 = link.x0 + (lw - w) / 2;
+	float y1 = link.y1 - (lh - h) / 2;
+	char name[32];
+
+	/* PDF space of the doc page -> its page space (ctm), then the region -> the link:
+	 * scale by s, flip y (page space points down), its top-left corner at (x0, y1). */
+	pdf_page_obj_transform(ctx, page_obj, &cropbox, &ctm);
+	m = fz_concat(ctm, fz_make_matrix(s, 0, 0, -s, x0 - r.x0 * s, y1 + r.y0 * s));
+
+	fz_snprintf(name, sizeof name, "PPThumb%d", t->page);
+	pdf_dict_puts(ctx, xobjects, name, page_form(ctx, doc, forms, t->page));
+	fz_append_printf(ctx, buf, "q 1 g %g %g %g %g re f Q\n", x0, y1 - h, w, h);
+	fz_append_printf(ctx, buf, "q %g %g %g %g re W n %g %g %g %g %g %g cm /%s Do Q\n",
+		x0, y1 - h, w, h, m.a, m.b, m.c, m.d, m.e, m.f, name);
+}
+
+/* Replaces the pp-thumb: links of one summary page with their thumbnails. */
+static void stamp_page(fz_context *ctx, pdf_document *doc, pdf_obj *page_obj, pdf_obj **forms,
+	const thumbnail *list, int n)
+{
+	pdf_obj *annots = pdf_dict_get(ctx, page_obj, PDF_NAME(Annots));
+	pdf_obj *res, *xobjects, *contents, *prologue = NULL, *stamps = NULL;
+	fz_buffer *buf = NULL, *pre = NULL;
+	int i, prepend, append, any = 0;
+
+	for (i = 0; i < pdf_array_len(ctx, annots); i++)
+	{
+		const char *uri = pdf_dict_get_text_string(ctx, pdf_dict_get(ctx, pdf_array_get(ctx, annots, i), PDF_NAME(A)), PDF_NAME(URI));
+		if (!strncmp(uri, "pp-thumb:", 9))
+			any = 1;
+	}
+	if (!any)
+		return;
+
+	/* Its own resources and contents, as pdf_bake_page does: the stamps draw in the page's
+	 * initial graphics state, whatever state Chrome's content ends in. */
+	res = pdf_dict_get(ctx, page_obj, PDF_NAME(Resources));
+	if (!res)
+	{
+		res = pdf_dict_get_inheritable(ctx, page_obj, PDF_NAME(Resources));
+		if (res)
+			pdf_dict_put(ctx, page_obj, PDF_NAME(Resources), res);
+		else
+			res = pdf_dict_put_dict(ctx, page_obj, PDF_NAME(Resources), 2);
+	}
+	xobjects = pdf_dict_get(ctx, res, PDF_NAME(XObject));
+	if (!xobjects)
+		xobjects = pdf_dict_put_dict(ctx, res, PDF_NAME(XObject), 8);
+
+	fz_var(buf);
+	fz_var(pre);
+	fz_var(prologue);
+	fz_var(stamps);
+	fz_try(ctx)
+	{
+		contents = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
+		pdf_count_q_balance(ctx, doc, res, contents, &prepend, &append);
+		pre = fz_new_buffer(ctx, 64);
+		for (i = 0; i <= prepend; i++)
+			fz_append_string(ctx, pre, "q\n");
+		buf = fz_new_buffer(ctx, 1024);
+		for (i = 0; i <= append; i++)
+			fz_append_string(ctx, buf, "Q\n");
+
+		for (i = 0; i < pdf_array_len(ctx, annots); )
+		{
+			pdf_obj *annot = pdf_array_get(ctx, annots, i);
+			const char *uri = pdf_dict_get_text_string(ctx, pdf_dict_get(ctx, annot, PDF_NAME(A)), PDF_NAME(URI));
+			const thumbnail *t;
+			if (strncmp(uri, "pp-thumb:", 9))
+			{
+				i++;
+				continue;
+			}
+			t = find_thumbnail(list, n, uri + 9);
+			if (t)
+				draw_thumbnail(ctx, doc, buf, xobjects, forms, t, pdf_dict_get_rect(ctx, annot, PDF_NAME(Rect)));
+			else
+				fz_warn(ctx, "no thumbnail %s in the plan", uri + 9);
+			pdf_array_delete(ctx, annots, i);
+		}
+
+		prologue = pdf_add_stream(ctx, doc, pre, NULL, 0);
+		stamps = pdf_add_stream(ctx, doc, buf, NULL, 0);
+		if (pdf_is_array(ctx, contents))
+		{
+			pdf_array_insert(ctx, contents, prologue, 0);
+			pdf_array_push(ctx, contents, stamps);
+		}
+		else
+		{
+			/* Built before it replaces /Contents: the put drops the old value. */
+			pdf_obj *array = pdf_new_array(ctx, doc, 3);
+			pdf_array_push(ctx, array, prologue);
+			if (contents)
+				pdf_array_push(ctx, array, contents);
+			pdf_array_push(ctx, array, stamps);
+			pdf_dict_put_drop(ctx, page_obj, PDF_NAME(Contents), array);
+		}
+	}
+	fz_always(ctx)
+	{
+		pdf_drop_obj(ctx, prologue);
+		pdf_drop_obj(ctx, stamps);
+		fz_drop_buffer(ctx, pre);
+		fz_drop_buffer(ctx, buf);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* pdf_graft_mapped_page copies a page's content and resources, not its /Annots: the
+ * summary's links (the placeholders among them) are copied here, each pointing at its new
+ * page rather than pulling the old one along through /P. */
+static void graft_annots(fz_context *ctx, pdf_graft_map *map, pdf_document *doc, pdf_obj *to_page,
+	pdf_document *src, pdf_obj *from_page)
+{
+	pdf_obj *from = pdf_dict_get(ctx, from_page, PDF_NAME(Annots));
+	pdf_obj *to, *copy = NULL, *grafted = NULL;
+	int i;
+
+	if (pdf_array_len(ctx, from) == 0)
+		return;
+	to = pdf_dict_put_array(ctx, to_page, PDF_NAME(Annots), pdf_array_len(ctx, from));
+	fz_var(copy);
+	fz_var(grafted);
+	fz_try(ctx)
+	{
+		for (i = 0; i < pdf_array_len(ctx, from); i++)
+		{
+			pdf_obj *annot = pdf_array_get(ctx, from, i);
+			if (!pdf_is_dict(ctx, annot))
+				continue;
+			copy = pdf_copy_dict(ctx, annot);
+			pdf_dict_del(ctx, copy, PDF_NAME(P));
+			pdf_dict_del(ctx, copy, PDF_NAME(Popup));
+			pdf_dict_del(ctx, copy, PDF_NAME(Parent));
+			grafted = pdf_graft_mapped_object(ctx, map, copy);
+			pdf_dict_put(ctx, grafted, PDF_NAME(P), to_page);
+			pdf_array_push_drop(ctx, to, pdf_add_object(ctx, doc, grafted));
+			pdf_drop_obj(ctx, grafted);
+			grafted = NULL;
+			pdf_drop_obj(ctx, copy);
+			copy = NULL;
+		}
+	}
+	fz_always(ctx)
+	{
+		pdf_drop_obj(ctx, grafted);
+		pdf_drop_obj(ctx, copy);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summary_path, const char *plan_path, const char *out_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, doc_path);
+	pdf_document *summary = NULL;
+	pdf_graft_map *map = NULL;
+	fz_pool *pool = fz_new_pool(ctx);
+	fz_buffer *plan_buf = NULL;
+	thumbnail *list = NULL;
+	pdf_obj **forms = NULL;
+	int doc_pages = 0, i, n = 0;
+
+	fz_var(summary);
+	fz_var(map);
+	fz_var(plan_buf);
+	fz_var(list);
+	fz_var(forms);
+	fz_var(doc_pages);
+	fz_try(ctx)
+	{
+		fz_json *plan, *keep;
+		int total;
+
+		load_all_objects(ctx, doc);
+		doc_pages = pdf_count_pages(ctx, doc);
+
+		plan_buf = fz_read_file(ctx, plan_path);
+		plan = fz_parse_json(ctx, pool, fz_string_from_buffer(ctx, plan_buf));
+		keep = fz_json_object_get(ctx, plan, "keepDocument");
+		list = parse_thumbnails(ctx, fz_json_object_get(ctx, plan, "thumbnails"), doc_pages, &n);
+		forms = fz_calloc(ctx, doc_pages, sizeof *forms);
+
+		pdf_bake_document(ctx, doc, 1, 1);
+
+		summary = pdf_open_document(ctx, summary_path);
+		map = pdf_new_graft_map(ctx, doc);
+		total = pdf_count_pages(ctx, summary);
+		for (i = 0; i < total; i++)
+		{
+			pdf_graft_mapped_page(ctx, map, -1, summary, i);
+			graft_annots(ctx, map, doc, pdf_lookup_page_obj(ctx, doc, doc_pages + i),
+				summary, pdf_lookup_page_obj(ctx, summary, i));
+		}
+
+		for (i = doc_pages; i < doc_pages + total; i++)
+			stamp_page(ctx, doc, pdf_lookup_page_obj(ctx, doc, i), forms, list, n);
+
+		if (!keep || !fz_json_to_boolean(ctx, keep))
+			pdf_delete_page_range(ctx, doc, 0, doc_pages);
+
+		save(ctx, doc, out_path);
+	}
+	fz_always(ctx)
+	{
+		if (forms)
+			for (i = 0; i < doc_pages; i++)
+				pdf_drop_obj(ctx, forms[i]);
+		fz_free(ctx, forms);
+		fz_free(ctx, list);
+		pdf_drop_graft_map(ctx, map);
+		pdf_drop_document(ctx, summary);
+		fz_drop_buffer(ctx, plan_buf);
+		fz_drop_pool(ctx, pool);
+		pdf_drop_document(ctx, doc);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
 /* ---- main --------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1241,6 +1618,8 @@ int main(int argc, char **argv)
 			cmd_repair(ctx, argv[2], argv[3]);
 		else if (!strcmp(cmd, "render") && argc >= 7 && (argc - 5) % 2 == 0)
 			cmd_render(ctx, argc - 2, argv + 2);
+		else if (!strcmp(cmd, "compose") && argc == 6)
+			cmd_compose(ctx, argv[2], argv[3], argv[4], argv[5]);
 		else
 		{
 			usage();
