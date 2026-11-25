@@ -1203,7 +1203,8 @@ static void cmd_render(fz_context *ctx, int argc, char **argv)
  *           "thumbnails": { "<key>": { "page": 3, "rect": [x0, y0, x1, y1] }, ... } }
  *
  * 1. doc's annotations and form fields are baked into its page content (links stay links),
- *    so the output prints them whatever the viewer does with annotations.
+ *    so the output prints them whatever the viewer does with annotations. Plain transparency
+ *    groups are dropped from their appearances first (drop_plain_group).
  * 2. summary's pages (the annotation list Chrome rendered) are appended.
  * 3. Every link on those pages whose URI is "pp-thumb:<key>" is a placeholder: it is removed,
  *    and the region "rect" of doc page "page" is drawn into its rect, fitted and centred, on
@@ -1501,6 +1502,40 @@ static void graft_annots(fz_context *ctx, pdf_graft_map *map, pdf_document *doc,
 		fz_rethrow(ctx);
 }
 
+/* A transparency group that is neither isolated nor knocks out changes nothing for a single
+ * appearance drawn on the page. Baked, it still matters to renderers that draw every group
+ * as isolated: poppler's Cairo backend (Evince) then blends a highlight's Multiply against
+ * nothing, and the highlight covers its text. */
+static void drop_plain_group(fz_context *ctx, pdf_obj *form)
+{
+	pdf_obj *group = pdf_dict_get(ctx, form, PDF_NAME(Group));
+	if (group && !pdf_dict_get_bool(ctx, group, PDF_NAME(I)) && !pdf_dict_get_bool(ctx, group, PDF_NAME(K)))
+		pdf_dict_del(ctx, form, PDF_NAME(Group));
+}
+
+/* drop_plain_group on every appearance pdf_bake_document is about to bake. */
+static void drop_plain_appearance_groups(fz_context *ctx, pdf_document *doc)
+{
+	int i, j, k, n = pdf_count_pages(ctx, doc);
+	for (i = 0; i < n; i++)
+	{
+		pdf_obj *annots = pdf_dict_get(ctx, pdf_lookup_page_obj(ctx, doc, i), PDF_NAME(Annots));
+		for (j = 0; j < pdf_array_len(ctx, annots); j++)
+		{
+			pdf_obj *annot = pdf_array_get(ctx, annots, j);
+			pdf_obj *normal = pdf_dict_getp(ctx, annot, "AP/N");
+			if (pdf_dict_get(ctx, annot, PDF_NAME(Subtype)) == PDF_NAME(Link))
+				continue;
+			if (pdf_is_stream(ctx, normal))
+				drop_plain_group(ctx, normal);
+			else if (pdf_is_dict(ctx, normal))
+				for (k = 0; k < pdf_dict_len(ctx, normal); k++)
+					if (pdf_is_stream(ctx, pdf_dict_get_val(ctx, normal, k)))
+						drop_plain_group(ctx, pdf_dict_get_val(ctx, normal, k));
+		}
+	}
+}
+
 static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summary_path, const char *plan_path, const char *out_path)
 {
 	pdf_document *doc = pdf_open_document(ctx, doc_path);
@@ -1532,6 +1567,7 @@ static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summa
 		list = parse_thumbnails(ctx, fz_json_object_get(ctx, plan, "thumbnails"), doc_pages, &n);
 		forms = fz_calloc(ctx, doc_pages, sizeof *forms);
 
+		drop_plain_appearance_groups(ctx, doc);
 		pdf_bake_document(ctx, doc, 1, 1);
 
 		summary = pdf_open_document(ctx, summary_path);

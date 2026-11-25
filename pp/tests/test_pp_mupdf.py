@@ -1086,6 +1086,29 @@ class Compose(Tool):
                            {'keepDocument': False, 'thumbnails': {'a': {'page': 0, 'rect': region}}})
         self.assertEqual(pixel(self.render_page(out, 0), 350, 442), (255, 0, 0, 255))
 
+    def test_baked_appearance_loses_a_plain_transparency_group(self):
+        # A highlight's Multiply inside a transparency group: once baked, poppler's Cairo
+        # backend (Evince) draws the group as isolated and the highlight covers the text.
+        # A non-isolated, non-knockout group around one appearance changes nothing on the
+        # page, so it goes; an isolated or knockout one stays.
+        # The colour where the highlight meets the blue square: Multiply of yellow over blue
+        # is black, unless the group is isolated, which by the spec blends against nothing.
+        for group, kept, colour in ((b'<< /S /Transparency >>', False, (0, 0, 0)),
+                                    (b'<< /S /Transparency /I true >>', True, (255, 255, 0)),
+                                    (b'<< /S /Transparency /K true >>', True, (0, 0, 0))):
+            with self.subTest(group=group):
+                pdf = PDF()
+                ap = pdf.add(b'<< /Type /XObject /Subtype /Form /BBox [100 600 200 700] /Group %s '
+                             b'/Resources << /ExtGState << /M << /BM /Multiply >> >> >> >>' % group,
+                             stream=b'/M gs 1 1 0 rg 100 600 100 100 re f')
+                hl = pdf.add(b'<< /Type /Annot /Subtype /Highlight /F 4 /Rect [100 600 200 700] '
+                             b'/QuadPoints [100 700 200 700 100 600 200 600] /AP << /N %d 0 R >> >>' % ap)
+                pdf, root, _ = simple_document([(b'0 0 1 rg 120 620 60 60 re f', b'[%s]' % ref(hl), None)], pdf=pdf)
+                spdf, sroot, _ = summary_document([])
+                out = self.compose(pdf.build(root), spdf.build(sroot), {'keepDocument': True, 'thumbnails': {}})
+                self.assertEqual(b'/Group' in out, kept)
+                self.assertEqual(pixel(self.render_page(out, 0), 150, 142)[:3], colour)
+
     def test_thumbnail_page_out_of_range_fails(self):
         pdf, root, _ = red_square_document()
         spdf, sroot, _ = summary_document([(b'pp-thumb:a', (300, 300, 400, 400))])
