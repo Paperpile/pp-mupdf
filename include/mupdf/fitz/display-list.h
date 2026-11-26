@@ -131,6 +131,14 @@ fz_rect fz_bound_display_list(fz_context *ctx, fz_display_list *list);
 fz_image *fz_new_image_from_display_list(fz_context *ctx, float w, float h, fz_display_list *list);
 
 /**
+	pp: the display list behind an image made by
+	fz_new_image_from_display_list (an SVG, for instance), or NULL
+	for any other image. transform receives the matrix that maps the
+	list to the unit square. The list is borrowed from the image.
+*/
+fz_display_list *fz_image_display_list(fz_context *ctx, fz_image *image, fz_matrix *transform);
+
+/**
 	Check for a display list being empty
 
 	list: The list to check.

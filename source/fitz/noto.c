@@ -555,3 +555,25 @@ fz_lookup_script_name(fz_context *ctx, int script, int language)
 	default: return fz_lookup_noto_stem_from_script(ctx, script, language);
 	}
 }
+
+/* pp: Droid Sans Fallback Full, a TrueType CJK font, whatever font the TOFU settings
+ * choose for CJK text. pp-mupdf compose lays out summaries with it: MuPDF can subset
+ * TrueType, but not Source Han Serif's CFF, which a PDF then embeds whole (20 MB). */
+#ifdef HAVE_OBJCOPY
+extern const unsigned char _binary_resources_fonts_droid_DroidSansFallbackFull_ttf_start;
+extern const unsigned char _binary_resources_fonts_droid_DroidSansFallbackFull_ttf_end;
+#else
+extern const unsigned char _binary_DroidSansFallbackFull_ttf[];
+extern const unsigned int _binary_DroidSansFallbackFull_ttf_size;
+#endif
+
+const unsigned char *pp_lookup_truetype_cjk_font(fz_context *ctx, int *size)
+{
+#ifdef HAVE_OBJCOPY
+	*size = (int)(&_binary_resources_fonts_droid_DroidSansFallbackFull_ttf_end - &_binary_resources_fonts_droid_DroidSansFallbackFull_ttf_start);
+	return &_binary_resources_fonts_droid_DroidSansFallbackFull_ttf_start;
+#else
+	*size = (int)_binary_DroidSansFallbackFull_ttf_size;
+	return _binary_DroidSansFallbackFull_ttf;
+#endif
+}

@@ -373,6 +373,12 @@ const unsigned char *fz_lookup_base14_font(fz_context *ctx, const char *name, in
 const unsigned char *fz_lookup_cjk_font(fz_context *ctx, int ordering, int *len, int *index);
 
 /**
+	pp: the built-in Droid Sans Fallback Full (TrueType CJK), whatever
+	font the TOFU settings choose for CJK text.
+*/
+const unsigned char *pp_lookup_truetype_cjk_font(fz_context *ctx, int *size);
+
+/**
 	Search the builtin cjk fonts for a match for a given language.
 	Whether a font is present or not will depend on the
 	configuration in which MuPDF is built.

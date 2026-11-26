@@ -1817,6 +1817,15 @@ display_list_image_get_digest(fz_context *ctx, fz_image *image_, unsigned char d
 	fz_md5_final(&state, digest);
 }
 
+fz_display_list *fz_image_display_list(fz_context *ctx, fz_image *image_, fz_matrix *transform)
+{
+	fz_display_list_image *image = (fz_display_list_image *)image_;
+	if (!image_ || image_->get_pixmap != display_list_image_get_pixmap)
+		return NULL;
+	*transform = image->transform;
+	return image->list;
+}
+
 fz_image *fz_new_image_from_display_list(fz_context *ctx, float w, float h, fz_display_list *list)
 {
 	fz_display_list_image *image;

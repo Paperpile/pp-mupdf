@@ -948,8 +948,19 @@ pdf_dev_fill_image(fz_context *ctx, fz_device *dev, fz_image *image, fz_matrix c
 	pdf_device *pdev = (pdf_device*)dev;
 	pdf_obj *im_res;
 	gstate *gs = CURRENT_GSTATE(pdev);
+	fz_matrix transform;
+	fz_display_list *list = fz_image_display_list(ctx, image, &transform);
 
 	pdf_dev_end_text(ctx, pdev);
+
+	/* pp: an image that is a display list (an SVG) is drawn as its vector content,
+	 * not rasterised. Only when opaque: the list's own fills carry no group alpha. */
+	if (list && alpha == 1)
+	{
+		fz_run_display_list(ctx, list, dev, fz_concat(transform, ctm), fz_infinite_rect, NULL);
+		return;
+	}
+
 	im_res = pdf_add_image(ctx, pdev->doc, image);
 	if (im_res == NULL)
 	{

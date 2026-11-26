@@ -24,8 +24,12 @@ build ?= release
 OS ?= $(shell uname)
 STRIP ?= strip
 
-MUPDF_SWITCHES := build=$(build) mujs=no html=no xps=no svg=no extract=no tesseract=no barcode=no
-FEATURE_FLAGS := -DFZ_ENABLE_CBZ=0 -DFZ_ENABLE_IMG=0 -DFZ_ENABLE_OCR_OUTPUT=0 \
+# The HTML engine lays out the annotation summary (compose); SVG draws its inline icons.
+# Neither opens documents: the HTML, EPUB, ... and SVG document handlers stay off.
+MUPDF_SWITCHES := build=$(build) mujs=no xps=no extract=no tesseract=no barcode=no USE_CMARK_GFM=no
+FEATURE_FLAGS := -DFZ_ENABLE_HTML_ENGINE=1 -DFZ_ENABLE_HTML=0 -DFZ_ENABLE_EPUB=0 -DFZ_ENABLE_FB2=0 \
+	-DFZ_ENABLE_MD=0 -DFZ_ENABLE_MOBI=0 -DFZ_ENABLE_OFFICE=0 -DFZ_ENABLE_TXT=0 \
+	-DFZ_ENABLE_CBZ=0 -DFZ_ENABLE_IMG=0 -DFZ_ENABLE_OCR_OUTPUT=0 \
 	-DFZ_ENABLE_ODT_OUTPUT=0 -DFZ_ENABLE_DOCX_OUTPUT=0 -DFZ_ENABLE_HYPHEN=0
 # MuPDF is C and handles errors with setjmp, so no unwind tables are needed.
 CODE_FLAGS := -fno-asynchronous-unwind-tables -fno-unwind-tables

@@ -20,6 +20,7 @@
  */
 #include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+#include "mupdf/ucdn.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +40,7 @@ static void usage(void)
 		"  pp-mupdf write  <in.pdf> <plan.json> <out.pdf>\n"
 		"  pp-mupdf repair <in.pdf> <out.pdf>\n"
 		"  pp-mupdf render <in.pdf> <pageIndex> <info.json> <scale> <out.pam> [<scale> <out.pam> ...]\n"
-		"  pp-mupdf compose <doc.pdf> <summary.pdf> <plan.json> <out.pdf>\n");
+		"  pp-mupdf compose <doc.pdf> <summary.pdf|-> <plan.json> <out.pdf>\n");
 }
 
 /* ---- JSON output helpers ------------------------------------------------- */
@@ -854,7 +855,7 @@ static fz_buffer *latin1_buffer(fz_context *ctx, const char *utf8)
 	return buf;
 }
 
-static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
+static void save_with(fz_context *ctx, pdf_document *doc, const char *out_path, int compress)
 {
 	pdf_write_options opts;
 	/* Garbage collection on save: a plain save of a document MuPDF repaired on open can
@@ -862,6 +863,10 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
 	 * input and plan give the same bytes, and encryption is removed (as PDFBox's writer
 	 * does), which also avoids fresh random encryption values on every save. */
 	pdf_parse_write_options(ctx, &opts, "garbage,regenerate-id=no,encrypt=none");
+	/* compress: the streams this run made (compose's laid out pages and their fonts) are
+	 * written uncompressed otherwise; streams already compressed stay as they are. */
+	opts.do_compress = compress;
+	opts.do_compress_fonts = compress;
 	fz_try(ctx)
 		pdf_save_document(ctx, doc, out_path, &opts);
 	fz_catch(ctx)
@@ -869,8 +874,15 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
 		fz_report_error(ctx);
 		fz_warn(ctx, "garbage-collecting save failed, saving without");
 		pdf_parse_write_options(ctx, &opts, "regenerate-id=no,encrypt=none");
+		opts.do_compress = compress;
+		opts.do_compress_fonts = compress;
 		pdf_save_document(ctx, doc, out_path, &opts);
 	}
+}
+
+static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
+{
+	save_with(ctx, doc, out_path, 0);
 }
 
 /*
@@ -1536,6 +1548,222 @@ static void drop_plain_appearance_groups(fz_context *ctx, pdf_document *doc)
 	}
 }
 
+/* ---- compose: the summary laid out from HTML --------------------------------------
+ *
+ * With "-" for the summary, compose lays out plan.summary itself with MuPDF's HTML engine
+ * (fz_story) instead of appending a PDF Chrome printed:
+ *
+ *   "summary": { "html": "<body html>", "css": "<css>",
+ *                "first": "<page furniture html, first page>", "other": "<later pages>",
+ *                "margin": [top, right, bottom, left] }
+ *
+ * Lengths are CSS px (1/96 in) as in Chrome, so the template's CSS keeps its numbers; the
+ * pages are A4 and the layout is drawn scaled by 0.75 into PDF points. The body flows
+ * through the margin box of as many pages as it needs. The furniture html of each page is
+ * laid out over the whole page (absolute positions place the logo and the like).
+ * An element with id "pp-thumb:<key>" is a thumbnail placeholder: each becomes a pp-thumb:
+ * link, as Chrome makes of the placeholders of a PDF summary, and stamp_page draws them.
+ * The fonts of the laid out pages are subset before that, while those pages draw nothing
+ * else: subsetting a page that shows a thumbnail would subset the document's own fonts. */
+
+#define CSS_PX 0.75f
+#define A4_W 595.28f
+#define A4_H 841.89f
+
+typedef struct
+{
+	pdf_document *doc;
+	pdf_obj *annots;
+} thumb_links;
+
+/* A pp-thumb: link over the box of each placeholder element on the page. */
+static void collect_thumb(fz_context *ctx, void *arg, const fz_story_element_position *pos)
+{
+	thumb_links *links = arg;
+	fz_rect r = pos->rect;
+	pdf_obj *link, *action;
+
+	if (!(pos->open_close & 1) || !pos->id || strncmp(pos->id, "pp-thumb:", 9))
+		return;
+	link = pdf_array_push_dict(ctx, links->annots, 5);
+	pdf_dict_put(ctx, link, PDF_NAME(Type), PDF_NAME(Annot));
+	pdf_dict_put(ctx, link, PDF_NAME(Subtype), PDF_NAME(Link));
+	pdf_dict_put_rect(ctx, link, PDF_NAME(Rect),
+		fz_make_rect(r.x0 * CSS_PX, A4_H - r.y1 * CSS_PX, r.x1 * CSS_PX, A4_H - r.y0 * CSS_PX));
+	action = pdf_dict_put_dict(ctx, link, PDF_NAME(A), 2);
+	pdf_dict_put(ctx, action, PDF_NAME(S), PDF_NAME(URI));
+	pdf_dict_put_text_string(ctx, action, PDF_NAME(URI), pos->id);
+}
+
+static const char *summary_string(fz_context *ctx, fz_json *summary, const char *key, int required)
+{
+	fz_json *v = fz_json_object_get(ctx, summary, key);
+	if (!v)
+	{
+		if (required)
+			fz_throw(ctx, FZ_ERROR_SYNTAX, "plan summary needs %s", key);
+		return NULL;
+	}
+	if (!fz_json_is_string(ctx, v))
+		fz_throw(ctx, FZ_ERROR_SYNTAX, "plan summary %s must be a string", key);
+	return fz_json_to_string(ctx, v);
+}
+
+static void draw_html(fz_context *ctx, fz_device *dev, const char *html, const char *css, fz_rect where)
+{
+	fz_buffer *buf = fz_new_buffer_from_copied_data(ctx, (const unsigned char *)html, strlen(html));
+	fz_story *story = NULL;
+	fz_rect filled;
+
+	fz_var(story);
+	fz_try(ctx)
+	{
+		story = fz_new_story(ctx, buf, css, 16, NULL);
+		fz_place_story(ctx, story, where, &filled);
+		fz_draw_story(ctx, story, dev, fz_scale(CSS_PX, CSS_PX));
+	}
+	fz_always(ctx)
+	{
+		fz_drop_story(ctx, story);
+		fz_drop_buffer(ctx, buf);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+/* One summary page: the next part of the body, the furniture, a link per thumbnail.
+ * Returns whether the body has more to place. */
+static int story_page(fz_context *ctx, pdf_document *doc, fz_story *story, const char *css,
+	const char *furniture, fz_rect body)
+{
+	fz_rect mediabox = fz_make_rect(0, 0, A4_W, A4_H);
+	fz_rect page_px = fz_make_rect(0, 0, A4_W / CSS_PX, A4_H / CSS_PX);
+	fz_buffer *contents = NULL;
+	pdf_obj *resources = NULL, *page = NULL;
+	fz_device *dev = NULL;
+	thumb_links links = { doc, NULL };
+	fz_rect filled;
+	int more = 0;
+
+	fz_var(contents);
+	fz_var(resources);
+	fz_var(page);
+	fz_var(dev);
+	fz_var(links);
+	fz_try(ctx)
+	{
+		links.annots = pdf_new_array(ctx, doc, 4);
+		dev = pdf_page_write(ctx, doc, mediabox, &resources, &contents);
+		more = fz_place_story(ctx, story, body, &filled);
+		fz_story_positions(ctx, story, collect_thumb, &links);
+		fz_draw_story(ctx, story, dev, fz_scale(CSS_PX, CSS_PX));
+		if (furniture)
+			draw_html(ctx, dev, furniture, css, page_px);
+		fz_close_device(ctx, dev);
+
+		page = pdf_add_page(ctx, doc, mediabox, 0, resources, contents);
+		if (pdf_array_len(ctx, links.annots))
+			pdf_dict_put(ctx, page, PDF_NAME(Annots), links.annots);
+		pdf_insert_page(ctx, doc, -1, page);
+	}
+	fz_always(ctx)
+	{
+		fz_drop_device(ctx, dev);
+		pdf_drop_obj(ctx, links.annots);
+		pdf_drop_obj(ctx, page);
+		pdf_drop_obj(ctx, resources);
+		fz_drop_buffer(ctx, contents);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+	return more;
+}
+
+/* The fallback font for CJK text in summaries: TrueType, so pdf_subset_fonts can cut it
+ * down to the glyphs used. Source Han Serif, the fallback otherwise, is CFF, which MuPDF
+ * fails to subset; a summary with a single CJK note then embedded all 20 MB of it. */
+static fz_font *summary_fallback_font(fz_context *ctx, int script, int language, int serif, int bold, int italic)
+{
+	const unsigned char *data;
+	fz_font *font;
+	int size;
+
+	switch (script)
+	{
+	case UCDN_SCRIPT_HAN:
+	case UCDN_SCRIPT_HANGUL:
+	case UCDN_SCRIPT_HIRAGANA:
+	case UCDN_SCRIPT_KATAKANA:
+	case UCDN_SCRIPT_BOPOMOFO:
+		break;
+	default:
+		return NULL;
+	}
+	data = pp_lookup_truetype_cjk_font(ctx, &size);
+	if (!data || size <= 0)
+		return NULL;
+	font = fz_new_font_from_memory(ctx, NULL, data, size, 0, 0);
+	fz_set_font_embedding(ctx, font, 1);
+	return font;
+}
+
+/* Appends the summary pages laid out from plan.summary, fonts subset, and returns how
+ * many there are. */
+static int story_pages(fz_context *ctx, pdf_document *doc, fz_json *summary)
+{
+	const char *html = summary_string(ctx, summary, "html", 1);
+	const char *css = summary_string(ctx, summary, "css", 0);
+	const char *first = summary_string(ctx, summary, "first", 0);
+	const char *other = summary_string(ctx, summary, "other", 0);
+	fz_json *margin = fz_json_object_get(ctx, summary, "margin");
+	float m[4] = { 0, 0, 0, 0 };
+	fz_buffer *buf = NULL;
+	fz_story *story = NULL;
+	fz_rect body;
+	int *added = NULL;
+	int i, start = pdf_count_pages(ctx, doc), pages = 0;
+
+	if (margin)
+	{
+		if (fz_json_array_length(ctx, margin) != 4)
+			fz_throw(ctx, FZ_ERROR_SYNTAX, "plan summary margin needs 4 numbers");
+		for (i = 0; i < 4; i++)
+			m[i] = (float)fz_json_to_number(ctx, fz_json_array_get(ctx, margin, i));
+	}
+	body = fz_make_rect(m[3], m[0], A4_W / CSS_PX - m[1], A4_H / CSS_PX - m[2]);
+	if (fz_is_empty_rect(body))
+		fz_throw(ctx, FZ_ERROR_ARGUMENT, "plan summary margins leave no room");
+
+	fz_var(buf);
+	fz_var(story);
+	fz_var(added);
+	fz_try(ctx)
+	{
+		buf = fz_new_buffer_from_copied_data(ctx, (const unsigned char *)html, strlen(html));
+		/* compose is the last thing this process does: the hook stays installed. */
+		fz_install_load_system_font_funcs(ctx, NULL, NULL, summary_fallback_font);
+		story = fz_new_story(ctx, buf, css, 16, NULL);
+		do
+			if (++pages > 10000)
+				fz_throw(ctx, FZ_ERROR_LIMIT, "summary does not end after %d pages", pages - 1);
+		while (story_page(ctx, doc, story, css, pages == 1 ? first : other, body));
+
+		added = fz_malloc_array(ctx, pages, int);
+		for (i = 0; i < pages; i++)
+			added[i] = start + i;
+		pdf_subset_fonts(ctx, doc, pages, added);
+	}
+	fz_always(ctx)
+	{
+		fz_free(ctx, added);
+		fz_drop_story(ctx, story);
+		fz_drop_buffer(ctx, buf);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+	return pages;
+}
+
 static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summary_path, const char *plan_path, const char *out_path)
 {
 	pdf_document *doc = pdf_open_document(ctx, doc_path);
@@ -1570,14 +1798,24 @@ static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summa
 		drop_plain_appearance_groups(ctx, doc);
 		pdf_bake_document(ctx, doc, 1, 1);
 
-		summary = pdf_open_document(ctx, summary_path);
-		map = pdf_new_graft_map(ctx, doc);
-		total = pdf_count_pages(ctx, summary);
-		for (i = 0; i < total; i++)
+		if (!strcmp(summary_path, "-"))
 		{
-			pdf_graft_mapped_page(ctx, map, -1, summary, i);
-			graft_annots(ctx, map, doc, pdf_lookup_page_obj(ctx, doc, doc_pages + i),
-				summary, pdf_lookup_page_obj(ctx, summary, i));
+			fz_json *html = fz_json_object_get(ctx, plan, "summary");
+			if (!html || !fz_json_is_object(ctx, html))
+				fz_throw(ctx, FZ_ERROR_SYNTAX, "plan needs a summary object when the summary is -");
+			total = story_pages(ctx, doc, html);
+		}
+		else
+		{
+			summary = pdf_open_document(ctx, summary_path);
+			map = pdf_new_graft_map(ctx, doc);
+			total = pdf_count_pages(ctx, summary);
+			for (i = 0; i < total; i++)
+			{
+				pdf_graft_mapped_page(ctx, map, -1, summary, i);
+				graft_annots(ctx, map, doc, pdf_lookup_page_obj(ctx, doc, doc_pages + i),
+					summary, pdf_lookup_page_obj(ctx, summary, i));
+			}
 		}
 
 		for (i = doc_pages; i < doc_pages + total; i++)
@@ -1586,7 +1824,7 @@ static void cmd_compose(fz_context *ctx, const char *doc_path, const char *summa
 		if (!keep || !fz_json_to_boolean(ctx, keep))
 			pdf_delete_page_range(ctx, doc, 0, doc_pages);
 
-		save(ctx, doc, out_path);
+		save_with(ctx, doc, out_path, 1);
 	}
 	fz_always(ctx)
 	{
