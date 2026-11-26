@@ -699,19 +699,34 @@ pdf_repair_xref_base(fz_context *ctx, pdf_document *doc)
 			if (!encrypt && list[i].stm_len >= 0)
 			{
 				pdf_obj *old_obj = NULL;
-				dict = pdf_load_object(ctx, doc, list[i].num);
+				pdf_obj *stm_dict = NULL;
 
+				/* pp: in a damaged file the object a stream was found at can
+				 * load as something else ('(text) stream': a string) or not load
+				 * at all ('obj stream' without a dictionary). Either threw and
+				 * failed the whole open, though no page may use that object;
+				 * now only its length is left uncorrected. */
+				fz_var(stm_dict);
 				fz_try(ctx)
 				{
-					length = pdf_new_int(ctx, list[i].stm_len);
-					pdf_dict_get_put_drop(ctx, dict, PDF_NAME(Length), length, &old_obj);
-					if (old_obj)
-						orphan_object(ctx, doc, old_obj);
+					stm_dict = pdf_load_object(ctx, doc, list[i].num);
+					if (pdf_is_dict(ctx, stm_dict))
+					{
+						length = pdf_new_int(ctx, list[i].stm_len);
+						pdf_dict_get_put_drop(ctx, stm_dict, PDF_NAME(Length), length, &old_obj);
+						if (old_obj)
+							orphan_object(ctx, doc, old_obj);
+					}
 				}
 				fz_always(ctx)
-					pdf_drop_obj(ctx, dict);
+					pdf_drop_obj(ctx, stm_dict);
 				fz_catch(ctx)
-					fz_rethrow(ctx);
+				{
+					fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
+					fz_rethrow_if(ctx, FZ_ERROR_SYSTEM);
+					fz_report_error(ctx);
+					fz_warn(ctx, "cannot correct the stream length of object (%d %d R)", list[i].num, list[i].gen);
+				}
 			}
 		}
 
@@ -805,9 +820,11 @@ pdf_repair_xref_base(fz_context *ctx, pdf_document *doc)
 static void
 pdf_repair_obj_stms(fz_context *ctx, pdf_document *doc)
 {
-	pdf_obj *dict;
+	pdf_obj *dict = NULL;
 	int i;
 	int xref_len = pdf_xref_len(ctx, doc);
+
+	fz_var(dict);
 
 	for (i = 0; i < xref_len; i++)
 	{
@@ -815,9 +832,13 @@ pdf_repair_obj_stms(fz_context *ctx, pdf_document *doc)
 
 		if (entry->stm_ofs)
 		{
-			dict = pdf_load_object(ctx, doc, i);
+			dict = NULL;
 			fz_try(ctx)
 			{
+				/* pp: loaded inside the try, so a stream that does not parse
+				 * ('obj stream' without a dictionary) is ignored like a broken
+				 * object stream instead of failing the whole open. */
+				dict = pdf_load_object(ctx, doc, i);
 				if (pdf_name_eq(ctx, pdf_dict_get(ctx, dict, PDF_NAME(Type)), PDF_NAME(ObjStm)))
 					pdf_repair_obj_stm(ctx, doc, i);
 			}

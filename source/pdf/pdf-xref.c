@@ -996,6 +996,10 @@ pdf_load_version(fz_context *ctx, pdf_document *doc)
 	doc->version = 10 * (fz_atof(s+5) + 0.05f);
 	if ((doc->version < 10 || doc->version > 17) && doc->version != 20)
 		fz_warn(ctx, "unknown PDF version: %d.%d", doc->version / 10, doc->version % 10);
+	/* pp: a marker without a "<digit>.<digit>" version ("%PDF-", "%PDF-1") or one below
+	 * 1.0 reads as 1.4, as PDFBox does, so a save does not write %PDF-0.0 or %PDF-1.0. */
+	if (!(s[5] >= '0' && s[5] <= '9' && s[6] == '.' && s[7] >= '0' && s[7] <= '9') || doc->version < 10)
+		doc->version = 14;
 
 	if (s != buf)
 	{
