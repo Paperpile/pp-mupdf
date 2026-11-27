@@ -25,7 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PP_MUPDF_VERSION "0.2.1"
+#define PP_MUPDF_VERSION "0.2.2"
 #define MAX_DEPTH 8
 
 static void usage(void)
