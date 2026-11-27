@@ -804,6 +804,26 @@ class Write(Tool):
         self.assertEqual([a['dict']['/Subtype'] for a in page['annots']], ['/Highlight', '/Text'])
         self.assertEqual(''.join(chr(c[0]) for c in page['chars']), 'HelloWorld')
 
+    def test_a_pdf_that_needs_a_password_is_refused_by_every_command(self):
+        # MuPDF opens such a file without the password; its streams and strings are then
+        # noise. check passed it, read returned noise and write saved an unreadable file.
+        pdf = PDF()
+        highlight = pdf.add(HIGHLIGHT)
+        pdf, root, _ = one_page(annots=b'[%s]' % ref(highlight), pdf=pdf)
+        data = pdf.build(root, trailer=encrypt(pdf, user_password=b'secret'))
+        path = self.save(data, 'locked.pdf')
+        out = self.path('out')
+        plan = self.path('plan.json')
+        with open(plan, 'w') as f:
+            json.dump({'objects': {}, 'pages': []}, f)
+        for args in (('check', path), ('check', path, '--no-repair'), ('info', path, out),
+                     ('read', path, out), ('write', path, plan, out), ('repair', path, out),
+                     ('render', path, '0', out, '1', self.path('p.pam'))):
+            with self.subTest(command=args[0]):
+                result = self.fails(*args)
+                self.assertIn(b'needs a password', result.stderr)
+                self.assertFalse(os.path.exists(out), 'a refused file left an output')
+
     def test_binary_string(self):
         out = self.write(self.three_annotations()[0], {
             'objects': {'@n': dict(text_annot('x'), **{'/NM': 'b:48656c6c6f'})},
