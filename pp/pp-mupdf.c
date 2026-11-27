@@ -894,10 +894,11 @@ static void save(fz_context *ctx, pdf_document *doc, const char *out_path)
 
 /*
  * Plan:
- *   { "objects": { "@id": <value> | { "stream": { "dict": {...}, "data": "..." } }, ... },
+ *   { "objects": { "@id": <value> | { "stream": { "dict": {...}, "data": "...", "deflate": true } }, ... },
  *     "pages": [ { "index": 3, "keep": [0, 2], "add": ["@a1", "@p1"] }, ... ] }
  * "keep" lists the indices of the page's current /Annots entries that stay (all when
- * absent); "add" appends created objects.
+ * absent); "add" appends created objects. A stream's data is stored as given, or, with
+ * "deflate": true, compressed with /Filter /FlateDecode set on its dictionary.
  */
 
 /*
@@ -970,10 +971,22 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
 					fz_var(buf);
 					fz_try(ctx)
 					{
+						fz_json *deflate = fz_json_object_get(ctx, stream, "deflate");
+						int compressed = 0;
+						buf = latin1_buffer(ctx, data ? fz_json_to_string(ctx, data) : "");
+						if (deflate && fz_json_is_boolean(ctx, deflate) && fz_json_to_boolean(ctx, deflate))
+						{
+							size_t n;
+							unsigned char *z = fz_new_deflated_data_from_buffer(ctx, &n, buf, FZ_DEFLATE_DEFAULT);
+							fz_drop_buffer(ctx, buf);
+							buf = NULL;
+							buf = fz_new_buffer_from_data(ctx, z, n);
+							pdf_dict_put(ctx, dict, PDF_NAME(Filter), PDF_NAME(FlateDecode));
+							compressed = 1;
+						}
 						pdf_update_object(ctx, doc, objs.list[i].num, dict);
 						ref = pdf_new_indirect(ctx, doc, objs.list[i].num, 0);
-						buf = latin1_buffer(ctx, data ? fz_json_to_string(ctx, data) : "");
-						pdf_update_stream(ctx, doc, ref, buf, 0);
+						pdf_update_stream(ctx, doc, ref, buf, compressed);
 					}
 					fz_always(ctx)
 					{
