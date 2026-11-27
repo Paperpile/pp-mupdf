@@ -12,11 +12,13 @@ full and the small (stripped fonts) build.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
+import zlib
 
 from pdfgen import PDF, append_update, encrypt, ref, simple_document, text, text_content
 
@@ -823,6 +825,34 @@ class Write(Tool):
                 result = self.fails(*args)
                 self.assertIn(b'needs a password', result.stderr)
                 self.assertFalse(os.path.exists(out), 'a refused file left an output')
+
+    def test_stream_with_deflate_is_stored_compressed(self):
+        content = 'q 1 0 0 rg 0 0 10 10 re f Q\n' * 40
+        form = {'/Type': '/XObject', '/Subtype': '/Form', '/BBox': [0, 0, 10, 10]}
+        annot = dict(text_annot('new'), **{'/AP': {'/N': '@ap'}})
+        sizes = {}
+        for deflate in (False, True):
+            stream = {'dict': dict(form), 'data': content}
+            if deflate:
+                stream['deflate'] = True
+            out = self.write(self.three_annotations()[0], {
+                'objects': {'@ap': {'stream': stream}, '@n': annot},
+                'pages': [{'index': 0, 'keep': [], 'add': ['@n']}]})
+            self.assertOpensCleanly(out)
+            self.assertEqual(b'/FlateDecode' in out, deflate)
+            self.assertEqual(content.encode() in out, not deflate)
+            sizes[deflate] = len(out)
+            if deflate:
+                head, _, rest = out.partition(b'/FlateDecode')
+                length = int(re.search(rb'/Length (\d+)', head[head.rfind(b' obj'):] + rest[:rest.find(b'stream')]).group(1))
+                start = rest.find(b'stream') + len(b'stream')
+                start += 2 if rest[start:start + 2] == b'\r\n' else 1
+                self.assertEqual(zlib.decompress(rest[start:start + length]).decode(), content)
+            # the stream decodes to what the plan gave: the page renders it without an error
+            path = self.save(out, 'deflate.pdf')
+            result = self.ok('render', path, '0', self.path('r.json'), '1', self.path('r.pam'))
+            self.assertEqual(result.stderr, b'')
+        self.assertLess(sizes[True], sizes[False])
 
     def test_binary_string(self):
         out = self.write(self.three_annotations()[0], {
