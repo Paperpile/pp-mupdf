@@ -470,11 +470,31 @@ static fz_json *page_chars(fz_context *ctx, fz_pool *pool, fz_page *page, const 
 	return chars;
 }
 
+/* Opens a PDF. One that needs a password to be read is refused: MuPDF opens it without
+ * one, and then every string and stream is undecrypted noise, which read would return as
+ * notes and write would save, without /Encrypt, as a file nothing can open again. A PDF
+ * with only an owner password (an empty user password) opens. */
+static pdf_document *open_document(fz_context *ctx, const char *in_path)
+{
+	pdf_document *doc = pdf_open_document(ctx, in_path);
+	fz_try(ctx)
+	{
+		if (pdf_needs_password(ctx, doc) && !pdf_authenticate_password(ctx, doc, ""))
+			fz_throw(ctx, FZ_ERROR_ARGUMENT, "the PDF needs a password");
+	}
+	fz_catch(ctx)
+	{
+		pdf_drop_document(ctx, doc);
+		fz_rethrow(ctx);
+	}
+	return doc;
+}
+
 /* ---- info ------------------------------------------------------------------ */
 
 static void cmd_info(fz_context *ctx, const char *in_path, const char *out_path)
 {
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	fz_pool *pool = fz_new_pool(ctx);
 	fz_try(ctx)
 	{
@@ -539,7 +559,7 @@ static void load_all_objects(fz_context *ctx, pdf_document *doc);
  * found, and repaired, by a later save. */
 static void cmd_check(fz_context *ctx, const char *in_path, int no_repair)
 {
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	fz_try(ctx)
 	{
 		int i, n;
@@ -586,7 +606,7 @@ static void cmd_check(fz_context *ctx, const char *in_path, int no_repair)
 
 static void cmd_read(fz_context *ctx, const char *in_path, const char *out_path, int with_chars)
 {
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	fz_pool *pool = fz_new_pool(ctx);
 	fz_try(ctx)
 	{
@@ -903,7 +923,7 @@ static void load_all_objects(fz_context *ctx, pdf_document *doc)
 
 static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_path, const char *out_path)
 {
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	fz_pool *pool = fz_new_pool(ctx);
 	fz_buffer *plan_buf = NULL;
 	new_objects objs = { NULL, 0 };
@@ -1048,7 +1068,7 @@ static void cmd_write(fz_context *ctx, const char *in_path, const char *plan_pat
  */
 static void cmd_repair(fz_context *ctx, const char *in_path, const char *out_path)
 {
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	pdf_obj *pages = NULL, *kids = NULL;
 	fz_var(pages);
 	fz_var(kids);
@@ -1154,7 +1174,7 @@ static void cmd_render(fz_context *ctx, int argc, char **argv)
 	const char *in_path = argv[0];
 	int page_index = atoi(argv[1]);
 	const char *info_path = argv[2];
-	pdf_document *doc = pdf_open_document(ctx, in_path);
+	pdf_document *doc = open_document(ctx, in_path);
 	fz_pool *pool = fz_new_pool(ctx);
 	pdf_page *page = NULL;
 	fz_var(page);

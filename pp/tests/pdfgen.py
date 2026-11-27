@@ -132,15 +132,17 @@ def rc4(key, data):
     return bytes(out)
 
 
-def encrypt(pdf, file_id=b'0123456789abcdef', owner_password=b'owner'):
+def encrypt(pdf, file_id=b'0123456789abcdef', owner_password=b'owner', user_password=b''):
     """Encrypts the streams of pdf in place with the standard security handler, revision 2
-    (RC4, 40-bit key) and an empty user password, as many older PDFs are. Returns the
+    (RC4, 40-bit key) and, by default, an empty user password, as many older PDFs are. With a
+    user_password the document cannot be read without it. Returns the
     trailer entries (/Encrypt and /ID). Strings outside streams are not encrypted, so a
     document using this must keep its text in streams."""
     owner_key = hashlib.md5(owner_password + PASSWORD_PAD[:32 - len(owner_password)]).digest()[:5]
-    o = rc4(owner_key, PASSWORD_PAD)
+    user = (user_password + PASSWORD_PAD)[:32]
+    o = rc4(owner_key, user)
     p = -4  # print and everything else allowed
-    key = hashlib.md5(PASSWORD_PAD + o + p.to_bytes(4, 'little', signed=True) + file_id).digest()[:5]
+    key = hashlib.md5(user + o + p.to_bytes(4, 'little', signed=True) + file_id).digest()[:5]
     u = rc4(key, PASSWORD_PAD)
     for num, (body, stream) in list(pdf.objects.items()):
         if stream is not None:
