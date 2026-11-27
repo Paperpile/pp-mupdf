@@ -261,6 +261,22 @@ class Layouts(Tool):
         annots = self.read(out)['pages'][0]['annots']
         self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:new'])
 
+    def test_read_with_a_stream_that_is_no_dictionary(self):
+        # A damaged file (no xref, so MuPDF rebuilds it) with an object no page uses whose
+        # 'stream' follows a string or nothing at all. Correcting that stream's /Length
+        # ('not a dict (string)') or loading it ('syntax error in object') failed the whole
+        # open; PDFBox reads such files (an oss-fuzz file of pdfplumber's tests).
+        tails = [b'9 0 obj\n(a string)\nstream\nxx\nendstream\nendobj\n',
+                 b'9 0 obj\n(a string) stream\nxx\nendstream\nendobj\n',
+                 b'9 0 obj\nstream\nxx\nendstream\nendobj\n']
+        for tail in tails:
+            with self.subTest(tail=tail):
+                pdf = PDF()
+                note = pdf.add(b'<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /Contents (kept) >>')
+                pdf, root, _ = one_page(annots=b'[%s]' % ref(note), pdf=pdf)
+                annots = self.read(pdf.build(root, xref='none') + tail)['pages'][0]['annots']
+                self.assertEqual([a['dict']['/Contents'] for a in annots], ['u:kept'])
+
     def test_check_accepts_repairable_file(self):
         pdf, root, _ = one_page()
         self.ok('check', self.save(pdf.build(root, xref='broken')))
@@ -679,6 +695,17 @@ class Write(Tool):
         out = self.write(data, {'objects': {'@n': text_annot('new')},
                                 'pages': [{'index': 0, 'add': ['@n']}]})
         self.assertEqual(self.subtypes(out), ['/Link', '/Highlight', '/Text', '/Text'])
+
+    def test_header_keeps_the_version_of_the_original(self):
+        # A catalog /Version only raises the version; a header without a "<digit>.<digit>"
+        # version is written as 1.4, as PDFBox writes it, not as %PDF-0.0 or %PDF-1.0.
+        cases = [(b'1.7', b'/Version /1.4', b'%PDF-1.7\n'), (b'1.4', b'/Version /1.6', b'%PDF-1.6\n'),
+                 (b'1.3', b'', b'%PDF-1.3\n'), (b'', b'', b'%PDF-1.4\n'), (b'1', b'', b'%PDF-1.4\n')]
+        for version, catalog, header in cases:
+            with self.subTest(version=version, catalog=catalog):
+                pdf, root, _ = one_page(pdf=PDF(version=version), catalog=catalog)
+                out = self.write(pdf.build(root), {'objects': {}, 'pages': []})
+                self.assertEqual(out[:len(header)], header)
 
     def test_empty_keep_removes_everything(self):
         data, _ = self.three_annotations()

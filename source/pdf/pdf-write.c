@@ -1660,7 +1660,10 @@ writeobjects(fz_context *ctx, pdf_document *doc, pdf_write_state *opts)
 
 	if (!opts->do_incremental)
 	{
-		int version = pdf_version(ctx, doc);
+		/* pp: the header keeps the version of the original. A catalog /Version only
+		 * raises it (a lower one does not lower the file's version, ISO 32000-1
+		 * 7.7.2), as PDFBox writes it. */
+		int version = fz_maxi(doc->version, pdf_version(ctx, doc));
 		fz_write_printf(ctx, opts->out, "%%PDF-%d.%d\n", version / 10, version % 10);
 		fz_write_string(ctx, opts->out, "%\xC2\xB5\xC2\xB6\n");
 	}
